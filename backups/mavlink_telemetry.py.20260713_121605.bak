@@ -1,0 +1,212 @@
+import threading
+import time
+import math
+from pymavlink import mavutil
+
+
+DEFAULT_CONNECTION = '/dev/ttyACM0'
+DEFAULT_BAUD = 115200
+
+# ArduPilot Copter Flight Modes mapping
+ARDUPILOT_COPTER_MODES = {
+    0: "STABILIZE",
+    1: "ACRO",
+    2: "ALT_HOLD",
+    3: "AUTO",
+    4: "GUIDED",
+    5: "LOITER",
+    6: "RTL",
+    7: "CIRCLE",
+    9: "LAND",
+    11: "DRIFT",
+    13: "SPORT",
+    14: "FLIP",
+    15: "AUTOTUNE",
+    16: "POSHOLD",
+    17: "BRAKE",
+    18: "THROW",
+    19: "AVOID_ADSB",
+    20: "GUIDED_NOGPS",
+    21: "SMART_RTL",
+    22: "FLOWHOLD",
+    23: "FOLLOW",
+    24: "ZIGZAG"
+}
+
+def initialize_target_from_heartbeat(mav, heartbeat, prefix="MAVLinkTelemetry"):
+    source_system = heartbeat.get_srcSystem()
+    source_component = heartbeat.get_srcComponent()
+    print(prefix + ": HEARTBEAT source system/component: " + str(source_system) + "/" + str(source_component))
+    print(prefix + ": Connection target before init: " + str(mav.target_system) + "/" + str(mav.target_component))
+
+    if source_system:
+        mav.target_system = source_system
+    if source_component:
+        mav.target_component = source_component
+
+    print(prefix + ": Connection target after init: " + str(mav.target_system) + "/" + str(mav.target_component))
+
+def request_data_streams(mav, rate_hz=4, prefix="MAVLinkTelemetry"):
+    mav.mav.request_data_stream_send(
+        mav.target_system,
+        mav.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_ALL,
+        rate_hz,
+        1
+    )
+    print(prefix + ": Requested data streams at " + str(rate_hz) + "Hz.")
+
+class MAVLinkTelemetry:
+    def __init__(self, connection_string=DEFAULT_CONNECTION, baud=DEFAULT_BAUD):
+        self.connection_string = connection_string
+        self.baud = baud
+        self.connected = False
+        self.last_heartbeat_time = 0.0
+        
+        # Telemetry fields
+        self.latitude = 0.0
+        self.longitude = 0.0
+        self.altitude = 0.0
+        self.heading = 0.0
+        self.pitch = 0.0
+        self.roll = 0.0
+        self.ground_speed = 0.0
+        self.gps_fix = 0
+        self.satellites = 0
+        self.flight_mode = "UNKNOWN"
+        self.armed = False
+        self.timestamp = 0.0
+        
+        self._lock = threading.Lock()
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._diagnostic_seen = set()
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    def _run(self):
+        print("MAVLinkTelemetry: Starting listener thread...")
+        while not self._stop_event.is_set():
+            try:
+                print("MAVLinkTelemetry: Connecting to " + self.connection_string + " at " + str(self.baud) + " baud...")
+                mav = mavutil.mavlink_connection(self.connection_string, baud=self.baud)
+
+                print("MAVLinkTelemetry: Waiting for HEARTBEAT...")
+                heartbeat = mav.wait_heartbeat(timeout=10.0)
+                if heartbeat is None:
+                    raise RuntimeError("Timeout waiting for HEARTBEAT")
+
+                initialize_target_from_heartbeat(mav, heartbeat)
+                request_data_streams(mav, rate_hz=4)
+
+                with self._lock:
+                    self._store_heartbeat(mav, heartbeat)
+                
+                while not self._stop_event.is_set():
+                    # Receive any message
+                    msg = mav.recv_match(blocking=True, timeout=1.0)
+                    if msg is None:
+                        # Timeout on recv_match
+                        with self._lock:
+                            if self.connected and (time.time() - self.last_heartbeat_time > 5.0):
+                                print("MAVLinkTelemetry: Connection timeout (no heartbeats).")
+                                self.connected = False
+                        continue
+                    
+                    msg_type = msg.get_type()
+                    
+                    if msg_type == 'HEARTBEAT':
+                        with self._lock:
+                            if not self.connected:
+                                try:
+                                    initialize_target_from_heartbeat(mav, msg)
+                                    request_data_streams(mav, rate_hz=4)
+                                except Exception as e:
+                                    print("MAVLinkTelemetry: Error requesting streams: " + str(e))
+                            
+                            self._store_heartbeat(mav, msg)
+                                
+                    elif msg_type == 'GLOBAL_POSITION_INT':
+                        with self._lock:
+                            self.latitude = msg.lat / 1e7
+                            self.longitude = msg.lon / 1e7
+                            self.altitude = msg.relative_alt / 1000.0  # AGL altitude in meters
+                            self.timestamp = time.time()
+                            self._print_once("GLOBAL_POSITION_INT",
+                                             "MAVLinkTelemetry: Received GLOBAL_POSITION_INT lat=" + str(self.latitude) +
+                                             " lon=" + str(self.longitude) +
+                                             " rel_alt_m=" + str(self.altitude))
+                            
+                    elif msg_type == 'ATTITUDE':
+                        with self._lock:
+                            self.roll = math.degrees(msg.roll)
+                            self.pitch = math.degrees(msg.pitch)
+                            self.heading = math.degrees(msg.yaw) % 360.0
+                            self.timestamp = time.time()
+                            self._print_once("ATTITUDE",
+                                             "MAVLinkTelemetry: Received ATTITUDE roll=" + str(self.roll) +
+                                             " pitch=" + str(self.pitch) +
+                                             " heading=" + str(self.heading))
+                            
+                    elif msg_type == 'GPS_RAW_INT':
+                        with self._lock:
+                            self.gps_fix = msg.fix_type
+                            self.satellites = msg.satellites_visible
+                            self.timestamp = time.time()
+                            self._print_once("GPS_RAW_INT",
+                                             "MAVLinkTelemetry: Received GPS_RAW_INT fix_type=" + str(self.gps_fix) +
+                                             " satellites=" + str(self.satellites))
+                            
+                    elif msg_type == 'VFR_HUD':
+                        with self._lock:
+                            self.ground_speed = msg.groundspeed
+                            self.timestamp = time.time()
+                            
+            except Exception as e:
+                print("MAVLinkTelemetry: Error in listener: " + str(e))
+                with self._lock:
+                    self.connected = False
+                time.sleep(2)
+
+    def _store_heartbeat(self, mav, msg):
+        self.connected = True
+        self.last_heartbeat_time = time.time()
+        self.timestamp = time.time()
+        self.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        self.flight_mode = ARDUPILOT_COPTER_MODES.get(msg.custom_mode, "UNKNOWN")
+        if self.flight_mode == "UNKNOWN" and hasattr(mav, 'flightmode'):
+            fm = mav.flightmode
+            if fm and not str(fm).startswith("Mode("):
+                self.flight_mode = str(fm)
+
+    def _print_once(self, key, message):
+        if key not in self._diagnostic_seen:
+            print(message)
+            self._diagnostic_seen.add(key)
+
+    def get_telemetry(self):
+        with self._lock:
+            # Dynamically check if connection is active
+            active = self.connected and (time.time() - self.last_heartbeat_time < 5.0)
+            return {
+                "connected": active,
+                "latitude": self.latitude,
+                "longitude": self.longitude,
+                "altitude": self.altitude,
+                "heading": self.heading,
+                "pitch": self.pitch,
+                "roll": self.roll,
+                "ground_speed": self.ground_speed,
+                "gps_fix": self.gps_fix,
+                "satellites": self.satellites,
+                "flight_mode": self.flight_mode,
+                "armed": self.armed,
+                "timestamp": self.timestamp
+            }

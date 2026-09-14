@@ -1,0 +1,1742 @@
+import cv2
+import time
+import json
+import os
+import numpy as np
+from datetime import datetime
+from mavlink_telemetry import MAVLinkTelemetry
+
+try:
+    from scout_mavlink_alert import ScoutMAVLinkAlertSender
+    SCOUT_MAVLINK_ALERT_AVAILABLE = True
+except Exception as e:
+    ScoutMAVLinkAlertSender = None
+    SCOUT_MAVLINK_ALERT_AVAILABLE = False
+    print("Warning: Scout MAVLink alert sender unavailable:", e)
+
+try:
+    from scout_auto_pause_controller import ScoutAutoPauseController
+    SCOUT_AUTO_PAUSE_AVAILABLE = True
+except Exception as e:
+    ScoutAutoPauseController = None
+    SCOUT_AUTO_PAUSE_AVAILABLE = False
+    print("Warning: Scout AUTO pause controller unavailable:", e)
+
+# ----------------------------------------------------
+# TELEMETRY SCHEMA DOCUMENTATION (MAVLink Integration)
+# ----------------------------------------------------
+"""
+Leader UAV Telemetry Schema (stored in leader_telemetry.json):
+{
+  "latitude": float,    # Latitude in decimal degrees (e.g. 32.8974). Maps to MAVLink GLOBAL_POSITION_INT.lat / 1e7
+  "longitude": float,   # Longitude in decimal degrees (e.g. -117.2024). Maps to MAVLink GLOBAL_POSITION_INT.lon / 1e7
+  "altitude": float,    # Altitude in meters above ground level (AGL). Maps to MAVLink GLOBAL_POSITION_INT.relative_alt / 1000.0
+  "heading": float,     # Yaw/heading in degrees from North (0 to 360). Maps to MAVLink ATTITUDE.yaw (converted to degrees)
+  "pitch": float,       # UAV pitch angle in degrees (positive nose up). Maps to MAVLink ATTITUDE.pitch (converted to degrees)
+  "roll": float         # UAV roll angle in degrees (positive right wing down). Maps to MAVLink ATTITUDE.roll (converted to degrees)
+}
+"""
+
+# ----------------------------------------------------
+# CONFIGURATION AND PARAMETERS
+# ----------------------------------------------------
+
+CLASSES = [
+    "background", "aeroplane", "bicycle", "bird", "boat",
+    "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
+    "dog", "horse", "motorbike", "person", "pottedplant",
+    "sheep", "sofa", "train", "tvmonitor"
+]
+
+TARGETS = ["person", "car", "bus", "motorbike"]
+
+# Configurable Thresholds & Flags
+DEBUG_DRONE = True
+
+DRONE_CANDIDATE_CONF = 0.10
+DRONE_CONFIRM_CONF = 0.25
+DRONE_NMS_THRESHOLD = 0.4
+DRONE_IOU_TRACK_THRESHOLD = 0.15
+DRONE_CENTER_DISTANCE_THRESHOLD = 120.0  # pixels
+DRONE_CONFIRM_FRAMES = 3
+DRONE_MAX_MISSED_FRAMES = 5
+DRONE_MIN_BOX_AREA_RATIO = 0.0005
+DRONE_MAX_BOX_AREA_RATIO = 0.35
+DRONE_MAX_BOX_WIDTH_RATIO = 0.65
+DRONE_MAX_BOX_HEIGHT_RATIO = 0.65
+DRONE_MIN_ASPECT_RATIO = 0.25
+DRONE_MAX_ASPECT_RATIO = 4.0
+DRONE_REJECT_SSD_IOU_THRESHOLD = 0.05
+
+ENABLE_MAVLINK_ALERTS = True
+MAVLINK_ALERT_COOLDOWN_SEC = 10
+MAVLINK_ALERT_PORT = "/dev/ttyACM0"
+MAVLINK_ALERT_BAUD = 115200
+
+ENABLE_AUTO_MISSION_PAUSE_ON_DETECTION = False
+AUTO_PAUSE_DRY_RUN = True
+AUTO_PAUSE_HOLD_MODE = "LOITER"
+AUTO_PAUSE_RETURN_MODE = "AUTO"
+AUTO_PAUSE_SECONDS = 10
+AUTO_PAUSE_COOLDOWN_SEC = 30
+
+import sys
+# Try loading Darknet GPU Python bindings
+DARKNET_GPU_AVAILABLE = False
+try:
+    sys.path.append("/home/jiacdi/darknet")
+    import darknet
+    DARKNET_GPU_AVAILABLE = True
+    print("Darknet GPU library imported successfully.")
+except Exception as e:
+    print("Warning: Could not import Darknet GPU library, falling back to OpenCV CPU:", e)
+
+if "--debug-drone" in sys.argv:
+    DEBUG_DRONE = True
+
+OLD_CONF = 0.55
+DRONE_CONF = DRONE_CANDIDATE_CONF
+
+
+# File Paths
+CAMERA_PARAMS_FILE = "/home/jiacdi/bordershield_ai/camera_params.json"
+EVENT_FILE = "/home/jiacdi/bordershield_ai/latest_target_event.json"
+DETECTION_IMAGE = "/home/jiacdi/bordershield_ai/latest_detection.jpg"
+
+# Caffe model paths (MobileNet SSD)
+CAFFE_PROTO = "/home/jiacdi/bordershield_ai/person_detection_model/deploy.prototxt"
+CAFFE_WEIGHTS = "/home/jiacdi/bordershield_ai/person_detection_model/mobilenet_iter_73000.caffemodel"
+
+# Darknet model paths (YOLOv3 Tiny Drone)
+DRONE_CFG = "/home/jiacdi/darknet/cfg/yolov3-tiny-drone.cfg"
+DRONE_WEIGHTS = "/home/jiacdi/darknet/backup/yolov3-tiny-drone_best.weights"
+DRONE_NAMES = "/home/jiacdi/darknet/data/obj.names"
+
+CAMERA_DEVICE_CANDIDATES = ["/dev/video0", "/dev/video1", "/dev/video2", "/dev/video3"]
+
+# Camera params defaults
+DEFAULT_CAMERA_PARAMS = {
+    "h_fov": 62.2,         # horizontal Field of View in degrees
+    "v_fov": 48.8,         # vertical Field of View in degrees
+    "mount_pitch": 15.0,   # camera mounting tilt down in degrees
+    "mount_yaw": 0.0,      # camera mounting yaw in degrees
+    "mount_roll": 0.0,     # camera mounting roll in degrees
+    "drone_width": 0.4     # assumed target drone physical width in meters
+}
+
+# ----------------------------------------------------
+# DARKNET GPU DETECTION WRAPPER
+# ----------------------------------------------------
+def detect_drones_gpu(net, class_names, darknet_image, thresh=0.10, nms=0.4):
+    """
+    Runs YOLO inference on GPU using Darknet shared library bindings.
+    """
+    pnum = darknet.ct.pointer(darknet.ct.c_int(0))
+    darknet.predict_image(net, darknet_image)
+    detections = darknet.get_network_boxes(net, darknet_image.w, darknet_image.h,
+                                           thresh, 0.5, None, 0, pnum, 0)
+    num = pnum[0]
+    if nms:
+        darknet.do_nms_sort(detections, num, len(class_names), nms)
+    
+    predictions = []
+    for j in range(num):
+        for idx, name in enumerate(class_names):
+            prob = detections[j].prob[idx]
+            if prob > thresh:
+                bbox = detections[j].bbox
+                predictions.append({
+                    'class': name,
+                    'class_id': idx,
+                    'conf': float(prob),
+                    'bbox': [float(bbox.x), float(bbox.y), float(bbox.w), float(bbox.h)]
+                })
+    darknet.free_detections(detections, num)
+    return predictions
+
+# ----------------------------------------------------
+# CLEAR STALE EVENTS ON STARTUP
+# ----------------------------------------------------
+if os.path.exists(EVENT_FILE):
+    try:
+        os.remove(EVENT_FILE)
+        print("Cleaned up stale latest_target_event.json on startup.")
+    except Exception as e:
+        print("Warning: Could not remove stale latest_target_event.json:", e)
+
+# ----------------------------------------------------
+# SAFE NON-MAXIMUM SUPPRESSION WRAPPER
+# ----------------------------------------------------
+def apply_safe_nms(boxes, confidences, conf_threshold, nms_threshold):
+    """
+    Safely applies Non-Maximum Suppression to bounding boxes and confidences.
+    Ensures standard Python types (int/float), checks for empty lists, and wraps in try-except.
+    """
+    if not boxes or not confidences:
+        return []
+
+    formatted_boxes = []
+    formatted_confs = []
+
+    for box, conf in zip(boxes, confidences):
+        try:
+            # Explicitly cast to standard Python scalar types to prevent C++ binding errors
+            fb = [int(box[0]), int(box[1]), int(box[2]), int(box[3])]
+            fc = float(conf)
+            formatted_boxes.append(fb)
+            formatted_confs.append(fc)
+        except (ValueError, TypeError, IndexError) as e:
+            print("Warning: Bounding box/confidence formatting error:", e)
+            continue
+
+    if not formatted_boxes or not formatted_confs:
+        return []
+
+    try:
+        # Call OpenCV DNN NMSBoxes
+        indices = cv2.dnn.NMSBoxes(formatted_boxes, formatted_confs, float(conf_threshold), float(nms_threshold))
+        
+        if len(indices) > 0:
+            # Flatten array depending on OpenCV version
+            if hasattr(indices, "flatten"):
+                return indices.flatten().tolist()
+            elif isinstance(indices[0], (list, tuple, np.ndarray)):
+                return [int(x[0]) for x in indices]
+            else:
+                return [int(x) for x in indices]
+    except Exception as e:
+        print("Warning: NMSBoxes call encountered an error. Falling back to all boxes. Error:", e)
+        return list(range(len(formatted_boxes)))
+
+    return []
+
+def validate_drone_candidate_box(box, frame_shape):
+    frame_h, frame_w = frame_shape[:2]
+    x, y, bw, bh = box
+    frame_area = float(max(frame_w * frame_h, 1))
+    box_area = float(max(bw * bh, 0))
+    area_ratio = box_area / frame_area
+    width_ratio = float(bw) / max(frame_w, 1)
+    height_ratio = float(bh) / max(frame_h, 1)
+    aspect_ratio = float(bw) / max(float(bh), 1.0)
+
+    if bw < 6 or bh < 6:
+        return False, "Rejected by size gate: box too small"
+    if area_ratio < DRONE_MIN_BOX_AREA_RATIO:
+        return False, "Rejected by size gate: area ratio {:.3f} below {:.3f}".format(area_ratio, DRONE_MIN_BOX_AREA_RATIO)
+    if area_ratio > DRONE_MAX_BOX_AREA_RATIO:
+        return False, "Rejected by size gate: area ratio {:.3f} above {:.3f}".format(area_ratio, DRONE_MAX_BOX_AREA_RATIO)
+    if width_ratio > DRONE_MAX_BOX_WIDTH_RATIO:
+        return False, "Rejected by size gate: width ratio {:.3f} above {:.3f}".format(width_ratio, DRONE_MAX_BOX_WIDTH_RATIO)
+    if height_ratio > DRONE_MAX_BOX_HEIGHT_RATIO:
+        return False, "Rejected by size gate: height ratio {:.3f} above {:.3f}".format(height_ratio, DRONE_MAX_BOX_HEIGHT_RATIO)
+    if aspect_ratio < DRONE_MIN_ASPECT_RATIO or aspect_ratio > DRONE_MAX_ASPECT_RATIO:
+        return False, "Rejected by size gate: aspect ratio {:.2f} outside {:.2f}-{:.2f}".format(
+            aspect_ratio, DRONE_MIN_ASPECT_RATIO, DRONE_MAX_ASPECT_RATIO
+        )
+    return True, "Passed size gate"
+
+def calculate_box_iou(box_a, box_b):
+    ax1, ay1, aw, ah = box_a
+    bx1, by1, bw, bh = box_b
+    ax2, ay2 = ax1 + aw, ay1 + ah
+    bx2, by2 = bx1 + bw, by1 + bh
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    area_a = max(0, aw) * max(0, ah)
+    area_b = max(0, bw) * max(0, bh)
+    return inter / float(area_a + area_b - inter + 1e-6)
+
+def find_overlapping_ssd_target(drone_box, ssd_detections):
+    dcx = drone_box[0] + drone_box[2] / 2.0
+    dcy = drone_box[1] + drone_box[3] / 2.0
+    best = None
+    best_iou = 0.0
+    for det in ssd_detections:
+        ssd_box = det['box']
+        iou = calculate_box_iou(drone_box, ssd_box)
+        center_inside = (
+            dcx >= ssd_box[0] and dcx <= ssd_box[0] + ssd_box[2] and
+            dcy >= ssd_box[1] and dcy <= ssd_box[1] + ssd_box[3]
+        )
+        if iou >= DRONE_REJECT_SSD_IOU_THRESHOLD or center_inside:
+            if best is None or iou > best_iou:
+                best = det
+                best_iou = iou
+    if best is None:
+        return None
+    return best['label'].upper(), best_iou
+
+def initialize_mavlink_alert_sender(telemetry_service):
+    if not ENABLE_MAVLINK_ALERTS:
+        print("MAVLINK ALERT SKIPPED: disabled by ENABLE_MAVLINK_ALERTS")
+        return None
+
+    if not SCOUT_MAVLINK_ALERT_AVAILABLE or ScoutMAVLinkAlertSender is None:
+        print("MAVLINK ALERT SKIPPED: scout_mavlink_alert.py import unavailable")
+        return None
+
+    sender = None
+    try:
+        sender = ScoutMAVLinkAlertSender(telemetry_service)
+        sender.connect(heartbeat_timeout=3.0, request_streams=False)
+        sender.start_heartbeat()
+        print("MAVLINK ALERT READY: Using shared MAVLink connection")
+        return sender
+    except Exception as e:
+        print("MAVLINK ALERT SKIPPED: sender init failed: {}".format(e))
+        print("MAVLINK ALERT SKIPPED: AI and local JSON flow will continue normally")
+        try:
+            sender.close()
+        except Exception:
+            pass
+        return None
+
+def is_valid_alert_location(loc):
+    if loc is None:
+        return False, "localization unavailable"
+
+    try:
+        lat = float(loc["gps"]["latitude"])
+        lon = float(loc["gps"]["longitude"])
+        alt_m = float(loc["gps"]["altitude"])
+    except Exception:
+        return False, "target GPS fields missing"
+
+    if not np.isfinite(lat) or not np.isfinite(lon) or not np.isfinite(alt_m):
+        return False, "target GPS is not finite"
+    if lat < -90.0 or lat > 90.0 or lon < -180.0 or lon > 180.0:
+        return False, "target GPS outside valid range"
+    if abs(lat) < 1e-7 and abs(lon) < 1e-7:
+        return False, "target GPS is zero/invalid"
+
+    return True, "ok"
+
+CLASS_THRESHOLDS = {
+    "PERSON": 0.55,
+    "CAR": 0.55,
+    "BUS": 0.55,
+    "MOTORBIKE": 0.55,
+    "DRONE": 0.25
+}
+
+def maybe_send_victim_alert(
+    telemetry,
+    target_class,
+    confidence,
+    track_id,
+    localization,
+    telemetry_valid,
+    gps_valid,
+    confirmation_state
+):
+    target_class = str(target_class).upper()
+    
+    # 1. Check if class is supported
+    if target_class not in ["PERSON", "CAR", "BUS", "MOTORBIKE", "DRONE"]:
+        return
+
+    # 2. Check if MAVLink alerts are enabled
+    if not ENABLE_MAVLINK_ALERTS:
+        print("REAL AI MAVLINK ALERT SKIPPED: class={} reason=disabled by ENABLE_MAVLINK_ALERTS".format(target_class))
+        return
+
+    # 3. Check if sender is available
+    if telemetry is None:
+        print("REAL AI MAVLINK ALERT SKIPPED: class={} reason=sender unavailable".format(target_class))
+        return
+
+    # 4. Check confirmation state
+    if not confirmation_state:
+        print("REAL AI MAVLINK ALERT SKIPPED: class={} reason=not confirmed".format(target_class))
+        return
+
+    # 5. Check confidence threshold
+    thresh = CLASS_THRESHOLDS.get(target_class, 0.55)
+    if confidence < thresh:
+        print("REAL AI MAVLINK ALERT SKIPPED: class={} reason=confidence below threshold".format(target_class))
+        return
+
+    # 6. Check telemetry connectivity
+    if not telemetry_valid:
+        print("REAL AI MAVLINK ALERT SKIPPED: class={} reason=telemetry unavailable".format(target_class))
+        return
+
+    # 7. Check GPS validity
+    if not gps_valid:
+        print("REAL AI MAVLINK ALERT SKIPPED: class={} reason=GPS invalid".format(target_class))
+        return
+
+    # 8. Check localization validity
+    location_ok, location_reason = is_valid_alert_location(localization)
+    if not location_ok:
+        print("REAL AI MAVLINK ALERT SKIPPED: class={} reason=localization unavailable".format(target_class))
+        return
+
+    # 9. Check cooldown
+    now = time.time()
+    cooldown_key = (target_class, track_id)
+    last_sent = mavlink_alert_last_sent_by_track.get(cooldown_key)
+    if last_sent is not None and (now - last_sent) < MAVLINK_ALERT_COOLDOWN_SEC:
+        print("REAL AI MAVLINK ALERT SKIPPED: class={} reason=cooldown active".format(target_class))
+        return
+
+    # 10. Perform transmission
+    lat = float(localization["gps"]["latitude"])
+    lon = float(localization["gps"]["longitude"])
+    alt_m = float(localization["gps"]["altitude"])
+
+    try:
+        # Print confirmed log as required
+        print("REAL AI VICTIM CONFIRMED: class={} confidence={:.4f} track_id={}".format(
+            target_class, confidence, track_id
+        ))
+        
+        result = telemetry.send_detection_alert(lat, lon, alt_m, confidence, target_class)
+        mavlink_alert_last_sent_by_track[cooldown_key] = now
+        
+        pct = int(round(confidence * 100.0))
+        alert_text = "BS,{:.7f},{:.7f},{:d},{}".format(lat, lon, pct, target_class)
+        print("REAL AI MAVLINK ALERT SENT: {}".format(alert_text))
+    except Exception as e:
+        print("REAL AI MAVLINK ALERT SKIPPED: class={} reason=send failure".format(target_class))
+
+
+def maybe_send_mavlink_alert(sender, last_sent_by_track, track, loc, is_telemetry_valid, is_gps_valid):
+    if track is None:
+        return
+    is_confirmed = track.get('confirmed', False)
+    confidence = float(track.get('conf', 0.0))
+    track_id = track.get('id')
+    maybe_send_victim_alert(
+        sender,
+        "DRONE",
+        confidence,
+        track_id,
+        loc,
+        is_telemetry_valid,
+        is_gps_valid,
+        is_confirmed
+    )
+
+def initialize_auto_pause_controller(telemetry_service, alert_sender, mode_state):
+    if not ENABLE_AUTO_MISSION_PAUSE_ON_DETECTION:
+        print("AUTO PAUSE DISABLED: ENABLE_AUTO_MISSION_PAUSE_ON_DETECTION is False")
+        return None
+
+    if not SCOUT_AUTO_PAUSE_AVAILABLE or ScoutAutoPauseController is None:
+        print("AUTO PAUSE SKIPPED: scout_auto_pause_controller.py import unavailable")
+        return None
+
+    try:
+        controller = ScoutAutoPauseController(
+            telemetry=telemetry_service,
+            alert_sender=alert_sender,
+            device=MAVLINK_ALERT_PORT,
+            baud=MAVLINK_ALERT_BAUD,
+            hold_mode=AUTO_PAUSE_HOLD_MODE,
+            return_mode=AUTO_PAUSE_RETURN_MODE,
+            hold_seconds=AUTO_PAUSE_SECONDS,
+            cooldown_sec=AUTO_PAUSE_COOLDOWN_SEC,
+            dry_run=AUTO_PAUSE_DRY_RUN,
+            current_mode_provider=lambda: mode_state.get("mode")
+        )
+        controller.connect(heartbeat_timeout=3.0)
+        print("AUTO PAUSE READY: hold_mode={} return_mode={} hold={}s cooldown={}s dry_run={}".format(
+            AUTO_PAUSE_HOLD_MODE,
+            AUTO_PAUSE_RETURN_MODE,
+            AUTO_PAUSE_SECONDS,
+            AUTO_PAUSE_COOLDOWN_SEC,
+            AUTO_PAUSE_DRY_RUN
+        ))
+        return controller
+    except Exception as e:
+        print("AUTO PAUSE SKIPPED: controller init failed: {}".format(e))
+        print("AUTO PAUSE SKIPPED: AI, GPS gates, local JSON flow, and BS alerts continue normally")
+        return None
+
+def get_auto_pause_sample(track_id):
+    return auto_pause_latest_samples.get(track_id)
+
+def maybe_start_auto_pause(controller, track, loc, telemetry, is_telemetry_valid, is_gps_valid):
+    if not ENABLE_AUTO_MISSION_PAUSE_ON_DETECTION:
+        return False
+
+    if controller is None:
+        print("AUTO PAUSE SKIPPED: controller not ready")
+        return False
+
+    if not is_telemetry_valid:
+        print("AUTO PAUSE SKIPPED: MAVLink telemetry invalid")
+        return False
+
+    if not is_gps_valid:
+        print("AUTO PAUSE SKIPPED: GPS/localization invalid")
+        return False
+
+    current_mode = str(telemetry.get("flight_mode", "UNKNOWN")).upper()
+    if current_mode != "AUTO":
+        print("AUTO PAUSE SKIPPED: current mode is {}, not AUTO".format(current_mode))
+        return False
+
+    if not track.get('confirmed', False):
+        print("AUTO PAUSE SKIPPED: track not confirmed")
+        return False
+
+    if float(track.get("conf", 0.0)) < DRONE_CONFIRM_CONF:
+        print("AUTO PAUSE SKIPPED: confidence below confirm threshold")
+        return False
+
+    location_ok, location_reason = is_valid_alert_location(loc)
+    if not location_ok:
+        print("AUTO PAUSE SKIPPED: {}".format(location_reason))
+        return False
+
+    return controller.pause_auto_mission_for_detection(track.get("id"), get_auto_pause_sample)
+
+# ----------------------------------------------------
+# HYBRID TRACKER (IOU + CENTER DISTANCE MATCHING)
+# ----------------------------------------------------
+class DroneTracker:
+    """
+    Hybrid Multi-Object Tracker that matches targets using intersection-over-union (IOU)
+    and center distance. Prevents duplicate tracks for small or fast-moving drones.
+    """
+    def __init__(self, max_age=5, min_hits=1, iou_threshold=0.15, max_dist_threshold=120.0):
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self.max_dist_threshold = max_dist_threshold
+        self.tracks = {}
+        self.next_id = 1
+
+    def _calculate_iou(self, boxA, boxB):
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+        boxAArea = boxA[2] * boxA[3]
+        boxBArea = boxB[2] * boxB[3]
+
+        return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+
+    def _center_distance(self, boxA, boxB):
+        ax = boxA[0] + boxA[2] / 2.0
+        ay = boxA[1] + boxA[3] / 2.0
+        bx = boxB[0] + boxB[2] / 2.0
+        by = boxB[1] + boxB[3] / 2.0
+        return float(np.sqrt((ax - bx)**2 + (ay - by)**2))
+
+    def _size_similarity(self, boxA, boxB):
+        w1, h1 = max(boxA[2], 1e-6), max(boxA[3], 1e-6)
+        w2, h2 = max(boxB[2], 1e-6), max(boxB[3], 1e-6)
+        return (min(w1, w2) / max(w1, w2)) * (min(h1, h2) / max(h1, h2))
+
+    def _distance_gate(self, boxA, boxB):
+        max_dim = max(boxA[2], boxA[3], boxB[2], boxB[3])
+        return max(self.max_dist_threshold, 1.5 * max_dim)
+
+    def _is_matchable(self, track, det):
+        iou = self._calculate_iou(track['bbox'], det['box'])
+        dist = self._center_distance(track['bbox'], det['box'])
+        size_similarity = self._size_similarity(track['bbox'], det['box'])
+        distance_gate = self._distance_gate(track['bbox'], det['box'])
+
+        if iou >= self.iou_threshold:
+            return True, 10.0 + iou, iou, dist, size_similarity
+        if dist <= distance_gate and size_similarity >= 0.15:
+            score = 1.0 + size_similarity * (1.0 - min(dist / distance_gate, 1.0))
+            return True, score, iou, dist, size_similarity
+        return False, 0.0, iou, dist, size_similarity
+
+    def update(self, detections):
+        # Predict: Increment misses for all active tracks
+        for tid in list(self.tracks.keys()):
+            self.tracks[tid]['misses'] += 1
+
+        matched_detections = set()
+        matched_tracks = set()
+
+        # Sort tracks by hits descending
+        sorted_tids = sorted(self.tracks.keys(), key=lambda k: self.tracks[k]['hits'], reverse=True)
+
+        # Generate match pairs candidates
+        pairs = []
+        for tid in sorted_tids:
+            track = self.tracks[tid]
+            for idx, det in enumerate(detections):
+                is_matchable, score, iou, dist, size_similarity = self._is_matchable(track, det)
+                
+                if is_matchable:
+                    pairs.append({
+                        'tid': tid,
+                        'det_idx': idx,
+                        'score': score,
+                        'iou': iou,
+                        'dist': dist,
+                        'size_similarity': size_similarity
+                    })
+
+        # Sort matches by score descending
+        pairs.sort(key=lambda x: x['score'], reverse=True)
+
+        for p in pairs:
+            tid = p['tid']
+            det_idx = p['det_idx']
+            if tid not in matched_tracks and det_idx not in matched_detections:
+                matched_tracks.add(tid)
+                matched_detections.add(det_idx)
+                
+                det = detections[det_idx]
+                track = self.tracks[tid]
+                track['bbox'] = det['box']
+                track['conf'] = det['conf']
+                track['misses'] = 0
+                track['hits'] += 1
+                track['consecutive_hits'] = track.get('consecutive_hits', 0) + 1
+                
+                # Update confirmed state stable check
+                if track['consecutive_hits'] >= DRONE_CONFIRM_FRAMES and det['conf'] >= DRONE_CONFIRM_CONF:
+                    track['confirmed'] = True
+                
+                # Bounding box smoothing
+                alpha = 0.5
+                track['smooth_bbox'] = [
+                    int(alpha * det['box'][i] + (1 - alpha) * track['smooth_bbox'][i])
+                    for i in range(4)
+                ]
+
+        # Register unmatched detections as new tracks
+        created_tracks = set()
+        for idx, det in enumerate(detections):
+            if idx not in matched_detections:
+                merge_tid = None
+                merge_score = -1.0
+                for tid, track in self.tracks.items():
+                    is_matchable, score, _, _, _ = self._is_matchable(track, det)
+                    if is_matchable and score > merge_score:
+                        merge_tid = tid
+                        merge_score = score
+
+                if merge_tid is not None:
+                    track = self.tracks[merge_tid]
+                    track['bbox'] = det['box']
+                    track['conf'] = max(track['conf'], det['conf'])
+                    track['misses'] = 0
+                    track['hits'] += 1
+                    track['consecutive_hits'] = track.get('consecutive_hits', 0) + 1
+                    alpha = 0.5
+                    track['smooth_bbox'] = [
+                        int(alpha * det['box'][i] + (1 - alpha) * track['smooth_bbox'][i])
+                        for i in range(4)
+                    ]
+                    if track['consecutive_hits'] >= DRONE_CONFIRM_FRAMES and track['conf'] >= DRONE_CONFIRM_CONF:
+                        track['confirmed'] = True
+                    matched_tracks.add(merge_tid)
+                else:
+                    tid = self.next_id
+                    self.tracks[tid] = {
+                        'id': tid,
+                        'bbox': det['box'],
+                        'smooth_bbox': det['box'],
+                        'conf': det['conf'],
+                        'hits': 1,
+                        'consecutive_hits': 1,
+                        'misses': 0,
+                        'confirmed': (DRONE_CONFIRM_FRAMES == 1 and det['conf'] >= DRONE_CONFIRM_CONF)
+                    }
+                    created_tracks.add(tid)
+                    self.next_id += 1
+
+        # Reset consecutive hits and check confirmation grace period for unmatched tracks
+        for tid in list(self.tracks.keys()):
+            if tid not in matched_tracks and tid not in created_tracks:
+                track = self.tracks[tid]
+                track['consecutive_hits'] = 0
+                if track['misses'] > 2:
+                    track['confirmed'] = False
+
+        # Delete expired tracks
+        for tid in list(self.tracks.keys()):
+            if self.tracks[tid]['misses'] > self.max_age:
+                del self.tracks[tid]
+
+        # Return active tracks
+        active = []
+        for tid, track in self.tracks.items():
+            if track['misses'] < self.max_age:
+                active.append(track)
+        return active
+
+
+class SSDTracker:
+    """
+    Independent tracker for SSD detections (PERSON, CAR, BUS, MOTORBIKE).
+    Partitions tracking by class_name, requiring at least 3 consecutive
+    hits to confirm a target.
+    """
+    def __init__(self, max_age=5, min_hits=3, iou_threshold=0.15, max_dist_threshold=120.0):
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self.max_dist_threshold = max_dist_threshold
+        self.tracks = {}
+        self.next_id = 1
+
+    def _calculate_iou(self, boxA, boxB):
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+        boxAArea = boxA[2] * boxA[3]
+        boxBArea = boxB[2] * boxB[3]
+
+        return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+
+    def _center_distance(self, boxA, boxB):
+        ax = boxA[0] + boxA[2] / 2.0
+        ay = boxA[1] + boxA[3] / 2.0
+        bx = boxB[0] + boxB[2] / 2.0
+        by = boxB[1] + boxB[3] / 2.0
+        return float(np.sqrt((ax - bx)**2 + (ay - by)**2))
+
+    def _size_similarity(self, boxA, boxB):
+        w1, h1 = max(boxA[2], 1e-6), max(boxA[3], 1e-6)
+        w2, h2 = max(boxB[2], 1e-6), max(boxB[3], 1e-6)
+        return (min(w1, w2) / max(w1, w2)) * (min(h1, h2) / max(h1, h2))
+
+    def _distance_gate(self, boxA, boxB):
+        max_dim = max(boxA[2], boxA[3], boxB[2], boxB[3])
+        return max(self.max_dist_threshold, 1.5 * max_dim)
+
+    def _is_matchable(self, track, det):
+        if track['class_name'] != det['class_name']:
+            return False, 0.0, 0.0, 0.0, 0.0
+        iou = self._calculate_iou(track['bbox'], det['box'])
+        dist = self._center_distance(track['bbox'], det['box'])
+        size_similarity = self._size_similarity(track['bbox'], det['box'])
+        distance_gate = self._distance_gate(track['bbox'], det['box'])
+
+        if iou >= self.iou_threshold:
+            return True, 10.0 + iou, iou, dist, size_similarity
+        if dist <= distance_gate and size_similarity >= 0.15:
+            score = 1.0 + size_similarity * (1.0 - min(dist / distance_gate, 1.0))
+            return True, score, iou, dist, size_similarity
+        return False, 0.0, iou, dist, size_similarity
+
+    def update(self, detections):
+        # Predict: Increment misses
+        for tid in list(self.tracks.keys()):
+            self.tracks[tid]['misses'] += 1
+
+        matched_detections = set()
+        matched_tracks = set()
+
+        # Sort tracks by hits descending
+        sorted_tids = sorted(self.tracks.keys(), key=lambda k: self.tracks[k]['hits'], reverse=True)
+
+        pairs = []
+        for tid in sorted_tids:
+            track = self.tracks[tid]
+            for idx, det in enumerate(detections):
+                is_matchable, score, iou, dist, size_similarity = self._is_matchable(track, det)
+                if is_matchable:
+                    pairs.append({
+                        'tid': tid,
+                        'det_idx': idx,
+                        'score': score
+                    })
+
+        pairs.sort(key=lambda x: x['score'], reverse=True)
+
+        for p in pairs:
+            tid = p['tid']
+            det_idx = p['det_idx']
+            if tid not in matched_tracks and det_idx not in matched_detections:
+                matched_tracks.add(tid)
+                matched_detections.add(det_idx)
+                
+                det = detections[det_idx]
+                track = self.tracks[tid]
+                track['bbox'] = det['box']
+                track['conf'] = det['conf']
+                track['misses'] = 0
+                track['hits'] += 1
+                track['consecutive_hits'] = track.get('consecutive_hits', 0) + 1
+                
+                if track['consecutive_hits'] >= self.min_hits:
+                    track['confirmed'] = True
+
+        # Clean old tracks
+        for tid in list(self.tracks.keys()):
+            if self.tracks[tid]['misses'] > self.max_age:
+                del self.tracks[tid]
+
+        # Init new tracks
+        for idx, det in enumerate(detections):
+            if idx not in matched_detections:
+                self.tracks[self.next_id] = {
+                    'id': self.next_id,
+                    'class_name': det['class_name'],
+                    'bbox': det['box'],
+                    'conf': det['conf'],
+                    'hits': 1,
+                    'consecutive_hits': 1,
+                    'misses': 0,
+                    'confirmed': False
+                }
+                self.next_id += 1
+
+        # Return active tracks
+        active = []
+        for tid, track in self.tracks.items():
+            if track['misses'] < self.max_age:
+                active.append(track)
+        return active
+
+
+# ----------------------------------------------------
+# ASPECT-RATIO PRESERVING LETTERBOX HELPER
+# ----------------------------------------------------
+def letterbox_image(image, target_size=(416, 416)):
+    """
+    Resizes image while preserving aspect ratio, padding the remainder with gray (127, 127, 127).
+    Returns the letterboxed image, the scale factor, and the padding offsets (dx, dy).
+    """
+    ih, iw = image.shape[:2]
+    w, h = target_size
+    scale = min(w / iw, h / ih)
+    nw = int(iw * scale)
+    nh = int(ih * scale)
+    
+    image_resized = cv2.resize(image, (nw, nh))
+    canvas = np.full((h, w, 3), 127, dtype=np.uint8)
+    
+    dx = (w - nw) // 2
+    dy = (h - nh) // 2
+    canvas[dy:dy+nh, dx:dx+nw] = image_resized
+    
+    return canvas, scale, dx, dy
+
+# ----------------------------------------------------
+# 3D CAMERA PROJECTIVE LOCALIZATION
+# ----------------------------------------------------
+def estimate_target_gps(bbox, uav_state, img_shape, camera_params):
+    """
+    Computes 3D relative position and estimated GPS of target drone
+    using camera Field of View, mounting tilt, and UAV telemetry.
+    """
+    x, y, w_p, h_p = bbox
+    img_h, img_w = img_shape
+    
+    # Bounding box center coordinates
+    cx_p = x + w_p / 2.0
+    cy_p = y + h_p / 2.0
+    
+    # Optical center
+    c_x = img_w / 2.0
+    c_y = img_h / 2.0
+    
+    # Calculate focal lengths from Field of View
+    h_fov_rad = np.radians(camera_params.get("h_fov", 62.2))
+    v_fov_rad = np.radians(camera_params.get("v_fov", 48.8))
+    f_x = c_x / np.tan(h_fov_rad / 2.0)
+    f_y = c_y / np.tan(v_fov_rad / 2.0)
+    
+    # 1. Distance (slant range) estimation via monocular target width
+    drone_real_w = camera_params.get("drone_width", 0.4)
+    distance = (drone_real_w * f_x) / max(w_p, 1.0)
+    
+    # 2. Camera Frame Vector (dx/f, dy/f, 1)
+    dx_p = cx_p - c_x
+    dy_p = cy_p - c_y
+    v_c = np.array([dx_p / f_x, dy_p / f_y, 1.0])
+    u_c = v_c / np.linalg.norm(v_c)
+    p_c = distance * u_c  # [X_c, Y_c, Z_c] in camera frame
+    
+    # 3. Rotate from Camera (C) to UAV Body (B) Frame
+    # Base: X_b = Z_c, Y_b = X_c, Z_b = Y_c
+    x_c, y_c, z_c = p_c
+    
+    mount_pitch = np.radians(camera_params.get("mount_pitch", 15.0))
+    mount_yaw = np.radians(camera_params.get("mount_yaw", 0.0))
+    mount_roll = np.radians(camera_params.get("mount_roll", 0.0))
+    
+    # Pitch mounting rotation (body Y axis)
+    xb_pitch = z_c * np.cos(mount_pitch) - y_c * np.sin(mount_pitch)
+    yb_pitch = x_c
+    zb_pitch = z_c * np.sin(mount_pitch) + y_c * np.cos(mount_pitch)
+    
+    # Yaw mounting rotation (body Z axis)
+    xb_yaw = xb_pitch * np.cos(mount_yaw) - yb_pitch * np.sin(mount_yaw)
+    yb_yaw = xb_pitch * np.sin(mount_yaw) + yb_pitch * np.cos(mount_yaw)
+    zb_yaw = zb_pitch
+    
+    # Roll mounting rotation (body X axis)
+    x_b = xb_yaw
+    y_b = yb_yaw * np.cos(mount_roll) - zb_yaw * np.sin(mount_roll)
+    z_b = yb_yaw * np.sin(mount_roll) + zb_yaw * np.cos(mount_roll)
+    
+    # 4. Rotate from UAV Body (B) to Local NED Frame (N)
+    uav_roll = np.radians(uav_state.get("roll", 0.0))
+    uav_pitch = np.radians(uav_state.get("pitch", 0.0))
+    uav_yaw = np.radians(uav_state.get("heading", 0.0))
+    
+    # Roll rotation (about body X)
+    x1 = x_b
+    y1 = y_b * np.cos(uav_roll) - z_b * np.sin(uav_roll)
+    z1 = y_b * np.sin(uav_roll) + z_b * np.cos(uav_roll)
+
+    # Pitch rotation (about body Y)
+    x2 = x1 * np.cos(uav_pitch) + z1 * np.sin(uav_pitch)
+    y2 = y1
+    z2 = -x1 * np.sin(uav_pitch) + z1 * np.cos(uav_pitch)
+
+    # Yaw rotation (about body Z)
+    x_n = x2 * np.cos(uav_yaw) - y2 * np.sin(uav_yaw)
+    y_n = x2 * np.sin(uav_yaw) + y2 * np.cos(uav_yaw)
+    z_n = z2
+    
+    # 5. GPS calculations from NED offset
+    uav_lat = uav_state.get("latitude", 32.8974)
+    uav_lon = uav_state.get("longitude", -117.2024)
+    uav_alt = uav_state.get("altitude", 50.0)
+    
+    R_earth = 6378137.0
+    d_lat = x_n / R_earth
+    d_lon = y_n / (R_earth * np.cos(np.radians(uav_lat)))
+    
+    target_lat = uav_lat + np.degrees(d_lat)
+    target_lon = uav_lon + np.degrees(d_lon)
+    target_alt = uav_alt - z_n  # target altitude AGL
+    
+    # Bearings & Elevation Angles
+    bearing_body = np.degrees(np.arctan2(y_b, x_b))
+    bearing_absolute = np.degrees(np.arctan2(y_n, x_n)) % 360.0
+    elevation_body = np.degrees(np.arcsin(-z_b / max(distance, 1e-3)))
+    elevation_absolute = np.degrees(np.arcsin(-z_n / max(distance, 1e-3)))
+    
+    return {
+        "distance": distance,
+        "relative_x_body": x_b,
+        "relative_y_body": y_b,
+        "relative_z_body": z_b,
+        "relative_x_ned": x_n,
+        "relative_y_ned": y_n,
+        "relative_z_ned": z_n,
+        "bearing_body_deg": bearing_body,
+        "bearing_absolute_deg": bearing_absolute,
+        "elevation_body_deg": elevation_body,
+        "elevation_absolute_deg": elevation_absolute,
+        "gps": {
+            "latitude": target_lat,
+            "longitude": target_lon,
+            "altitude": target_alt
+        }
+    }
+
+# ----------------------------------------------------
+# LOAD MODELS
+# ----------------------------------------------------
+print("Loading Caffe MobileNet SSD model...")
+old_net = cv2.dnn.readNetFromCaffe(CAFFE_PROTO, CAFFE_WEIGHTS)
+
+print("Loading Darknet YOLOv3-Tiny Drone model...")
+with open(DRONE_NAMES, "r") as f:
+    DRONE_CLASSES = [x.strip() for x in f.readlines() if x.strip()]
+
+# GPU/CPU execution flags and parameters initialization
+drone_net_gpu = None
+drone_net = None
+drone_layers = []
+darknet_image = None
+net_w = 416
+net_h = 416
+
+if DARKNET_GPU_AVAILABLE:
+    try:
+        # Load network using darknet ctypes wrapper
+        # Set working directory context for darknet to resolve relative paths
+        orig_cwd = os.getcwd()
+        os.chdir("/home/jiacdi/darknet")
+        DRONE_DATA = "/home/jiacdi/darknet/data/obj.data"
+        drone_net_gpu, _, _ = darknet.load_network(
+            DRONE_CFG,
+            DRONE_DATA,
+            DRONE_WEIGHTS,
+            batch_size=1
+        )
+        os.chdir(orig_cwd)
+        
+        net_w = darknet.network_width(drone_net_gpu)
+        net_h = darknet.network_height(drone_net_gpu)
+        darknet_image = darknet.make_image(net_w, net_h, 3)
+        print("Successfully loaded Darknet GPU model (w={}, h={}).".format(net_w, net_h))
+    except Exception as e:
+        print("Failed to initialize Darknet GPU model, falling back to OpenCV CPU:", e)
+        DARKNET_GPU_AVAILABLE = False
+
+if not DARKNET_GPU_AVAILABLE:
+    print("Loading model via OpenCV CPU fallback...")
+    drone_net = cv2.dnn.readNetFromDarknet(DRONE_CFG, DRONE_WEIGHTS)
+    
+    def get_output_layers(net):
+        layer_names = net.getLayerNames()
+        return [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+        
+    drone_layers = get_output_layers(drone_net)
+    drone_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+    drone_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+# Set SSD model settings to CPU
+old_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+old_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+def open_camera_auto():
+    print("Camera autodetection: trying {}".format(", ".join(CAMERA_DEVICE_CANDIDATES)))
+    for device_path in CAMERA_DEVICE_CANDIDATES:
+        if not os.path.exists(device_path):
+            print("Camera autodetection: {} does not exist".format(device_path))
+            continue
+
+        cap = cv2.VideoCapture(device_path, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        if not cap.isOpened():
+            print("Camera autodetection: {} failed isOpened()".format(device_path))
+            cap.release()
+            continue
+
+        ok, test_frame = cap.read()
+        if not ok or test_frame is None:
+            print("Camera autodetection: {} opened but cap.read() failed".format(device_path))
+            cap.release()
+            continue
+
+        print("CAMERA SELECTED: {}".format(device_path))
+        print("Camera frame shape: {}".format(test_frame.shape))
+        return cap, device_path
+
+    print("CRITICAL ERROR: Could not open any camera from /dev/video0 to /dev/video3 using cv2.CAP_V4L2.")
+    return None, None
+
+# ----------------------------------------------------
+# MAIN ACQUISITION LOOP
+# ----------------------------------------------------
+cap, selected_camera_device = open_camera_auto()
+
+if cap is None:
+    os._exit(1)
+
+tracker = DroneTracker(
+    max_age=DRONE_MAX_MISSED_FRAMES,
+    min_hits=1,
+    iou_threshold=DRONE_IOU_TRACK_THRESHOLD,
+    max_dist_threshold=DRONE_CENTER_DISTANCE_THRESHOLD
+)
+ssd_tracker = SSDTracker(
+    max_age=5,
+    min_hits=3,
+    iou_threshold=0.15,
+    max_dist_threshold=120.0
+)
+frame_count = 0
+
+print("BorderShield Leader Recon AI system started successfully.")
+print("Detecting: PERSON / VEHICLE / DRONE")
+print("Dynamic Telemetry: ENABLED")
+print("3D Target Localization: ENABLED")
+print("Press CTRL+C to stop.")
+
+# Initialize and start MAVLink telemetry service first
+telemetry_service = MAVLinkTelemetry(connection_string='/dev/ttyACM0', baud=115200)
+telemetry_service.start()
+
+# Initialize MAVLink alert sender by injecting telemetry service
+mavlink_alert_sender = initialize_mavlink_alert_sender(telemetry_service)
+mavlink_alert_last_sent_by_track = {}
+auto_pause_mode_state = {"mode": None}
+auto_pause_latest_samples = {}
+# Initialize auto pause controller by injecting telemetry service and alert sender
+auto_pause_controller = initialize_auto_pause_controller(telemetry_service, mavlink_alert_sender, auto_pause_mode_state)
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("ERROR: Failed to read frame")
+            break
+
+        frame_count += 1
+        h, w = frame.shape[:2]
+        start_time = time.time()
+        alerts = []
+
+        # ----------------------------------------------------
+        # 1. LOAD UAV TELEMETRY & CAMERA PARAMS
+        # ----------------------------------------------------
+        telemetry = telemetry_service.get_telemetry()
+        is_telemetry_valid = telemetry["connected"]
+        is_gps_valid = is_telemetry_valid and (telemetry["gps_fix"] > 1) and (telemetry["satellites"] > 0)
+        auto_pause_mode_state["mode"] = telemetry.get("flight_mode")
+        
+        if is_telemetry_valid:
+            uav_state = {
+                "latitude": telemetry["latitude"],
+                "longitude": telemetry["longitude"],
+                "altitude": telemetry["altitude"],
+                "heading": telemetry["heading"],
+                "pitch": telemetry["pitch"],
+                "roll": telemetry["roll"]
+            }
+        else:
+            uav_state = None
+
+        camera_params = DEFAULT_CAMERA_PARAMS.copy()
+        if os.path.exists(CAMERA_PARAMS_FILE):
+            try:
+                with open(CAMERA_PARAMS_FILE, "r") as cf:
+                    camera_params.update(json.load(cf))
+            except Exception:
+                pass
+        else:
+            try:
+                with open(CAMERA_PARAMS_FILE, "w") as cf:
+                    json.dump(camera_params, cf, indent=2)
+            except Exception:
+                pass
+
+        # ----------------------------------------------------
+        # 2. RUN MOBILENET SSD (PERSONS/VEHICLES)
+        # ----------------------------------------------------
+        blob = cv2.dnn.blobFromImage(frame, 0.007843, (300, 300), 127.5)
+        old_net.setInput(blob)
+        detections = old_net.forward()
+
+        ssd_boxes = []
+        ssd_confidences = []
+        ssd_labels = []
+
+        for i in range(detections.shape[2]):
+            confidence = float(detections[0, 0, i, 2])
+            class_id = int(detections[0, 0, i, 1])
+
+            if class_id < 0 or class_id >= len(CLASSES):
+                continue
+
+            label_name = CLASSES[class_id]
+
+            if confidence > OLD_CONF and label_name in TARGETS:
+                box = detections[0, 0, i, 3:7] * [w, h, w, h]
+                x1, y1, x2, y2 = box.astype("int")
+                
+                # Safeguard dimensions and convert explicitly to standard Python ints
+                x1 = int(max(0, x1))
+                y1 = int(max(0, y1))
+                x2 = int(min(w - 1, x2))
+                y2 = int(min(h - 1, y2))
+                bw = int(max(0, x2 - x1))
+                bh = int(max(0, y2 - y1))
+                
+                if bw > 0 and bh > 0:
+                    ssd_boxes.append([x1, y1, bw, bh])
+                    ssd_confidences.append(float(confidence))
+                    ssd_labels.append(label_name)
+
+        # Apply safe NMS to SSD detections
+        ssd_nms_indices = apply_safe_nms(ssd_boxes, ssd_confidences, OLD_CONF, 0.4)
+        confirmed_ssd = []
+        for idx in ssd_nms_indices:
+            confirmed_ssd.append({
+                'label': ssd_labels[idx],
+                'conf': ssd_confidences[idx],
+                'box': ssd_boxes[idx]
+            })
+            alerts.append("{} {:.1f}%".format(ssd_labels[idx].upper(), ssd_confidences[idx] * 100))
+
+        if confirmed_ssd or DEBUG_DRONE:
+            if confirmed_ssd:
+                ssd_status = ", ".join([
+                    "{} {:.1f}%".format(det['label'].upper(), det['conf'] * 100)
+                    for det in confirmed_ssd
+                ])
+            else:
+                ssd_status = "none"
+            print("Frame {} | SSD targets: {}".format(frame_count, ssd_status))
+
+        # ----------------------------------------------------
+        # 3. RUN YOLOv3-TINY (DRONE MODEL)
+        # ----------------------------------------------------
+        yolo_boxes = []
+        yolo_confidences = []
+
+        if DARKNET_GPU_AVAILABLE:
+            # Apply aspect-ratio-preserving letterboxing to match Darknet training preprocessing
+            letterboxed_img, lb_scale, lb_dx, lb_dy = letterbox_image(frame, (net_w, net_h))
+            
+            # Convert to RGB bytes and copy to Darknet image
+            img_rgb = cv2.cvtColor(letterboxed_img, cv2.COLOR_BGR2RGB)
+            img_data = img_rgb.tobytes()
+            darknet.copy_image_from_bytes(darknet_image, img_data)
+            
+            # Run GPU detection
+            gpu_dets = detect_drones_gpu(drone_net_gpu, DRONE_CLASSES, darknet_image, thresh=DRONE_CANDIDATE_CONF, nms=DRONE_NMS_THRESHOLD)
+            
+            for det in gpu_dets:
+                cx_lb = det['bbox'][0]
+                cy_lb = det['bbox'][1]
+                w_lb = det['bbox'][2]
+                h_lb = det['bbox'][3]
+                confidence = det['conf']
+                
+                # Map coordinates back to original image space
+                cx_orig = (cx_lb - lb_dx) / lb_scale
+                cy_orig = (cy_lb - lb_dy) / lb_scale
+                w_orig = w_lb / lb_scale
+                h_orig = h_lb / lb_scale
+                
+                x_left = int(cx_orig - w_orig / 2.0)
+                y_top = int(cy_orig - h_orig / 2.0)
+                width_p = int(w_orig)
+                height_p = int(h_orig)
+                
+                x_left = int(max(0, x_left))
+                y_top = int(max(0, y_top))
+                width_p = int(min(w - x_left, width_p))
+                height_p = int(min(h - y_top, height_p))
+                
+                if width_p > 0 and height_p > 0:
+                    yolo_boxes.append([x_left, y_top, width_p, height_p])
+                    yolo_confidences.append(float(confidence))
+        else:
+            # Fallback to OpenCV CPU
+            # Apply aspect-ratio-preserving letterboxing to match Darknet training preprocessing
+            letterboxed_img, lb_scale, lb_dx, lb_dy = letterbox_image(frame, (net_w, net_h))
+            
+            # Feed letterboxed image into network (size is already exactly 416x416)
+            drone_blob = cv2.dnn.blobFromImage(letterboxed_img, 1/255.0, (net_w, net_h), swapRB=True, crop=False)
+            drone_net.setInput(drone_blob)
+            outs = drone_net.forward(drone_layers)
+
+            for out in outs:
+                for detection in out:
+                    scores = detection[5:]
+                    if len(scores) == 0:
+                        continue
+                    
+                    # Correct Darknet parsing: final confidence is objectness (detection[4]) * class probability
+                    objectness = float(detection[4])
+                    class_id = int(scores.argmax())
+                    confidence = objectness * float(scores[class_id])
+
+                    if confidence > DRONE_CONF:
+                        cx_norm, cy_norm, bw_norm, bh_norm = detection[0:4]
+                        
+                        cx_lb = cx_norm * net_w
+                        cy_lb = cy_norm * net_h
+                        w_lb = bw_norm * net_w
+                        h_lb = bh_norm * net_h
+                        
+                        cx_orig = (cx_lb - lb_dx) / lb_scale
+                        cy_orig = (cy_lb - lb_dy) / lb_scale
+                        w_orig = w_lb / lb_scale
+                        h_orig = h_lb / lb_scale
+                        
+                        x_left = int(cx_orig - w_orig / 2.0)
+                        y_top = int(cy_orig - h_orig / 2.0)
+                        width_p = int(w_orig)
+                        height_p = int(h_orig)
+                        
+                        x_left = int(max(0, x_left))
+                        y_top = int(max(0, y_top))
+                        width_p = int(min(w - x_left, width_p))
+                        height_p = int(min(h - y_top, height_p))
+                        
+                        if width_p > 0 and height_p > 0:
+                            yolo_boxes.append([x_left, y_top, width_p, height_p])
+                            yolo_confidences.append(float(confidence))
+
+        # Best drone confidence for this frame
+        best_raw_conf = max(yolo_confidences) if yolo_confidences else 0.0
+        if DEBUG_DRONE:
+            print("[DEBUG DRONE] Frame {} | drone_best confidence = {:.2f}%".format(frame_count, best_raw_conf * 100))
+
+        # Apply safe NMS to YOLO detections
+        drone_nms_indices = apply_safe_nms(yolo_boxes, yolo_confidences, DRONE_CANDIDATE_CONF, DRONE_NMS_THRESHOLD)
+        drone_detections = []
+        drone_size_rejections = {}
+        for idx in drone_nms_indices:
+            size_ok, size_reason = validate_drone_candidate_box(yolo_boxes[idx], frame.shape)
+            ssd_overlap = find_overlapping_ssd_target(yolo_boxes[idx], confirmed_ssd) if size_ok else None
+            if not size_ok:
+                drone_size_rejections[idx] = size_reason
+            elif ssd_overlap is not None:
+                ssd_label, ssd_iou = ssd_overlap
+                drone_size_rejections[idx] = "Rejected by SSD overlap: {} target IoU {:.3f}".format(ssd_label, ssd_iou)
+            else:
+                drone_detections.append({
+                    'box': yolo_boxes[idx],
+                    'conf': yolo_confidences[idx]
+                })
+
+        # Update drone tracker
+        active_tracks = tracker.update(drone_detections)
+
+        # Print tracker debug details
+        if DEBUG_DRONE:
+            print("[DEBUG DRONE] --- Frame {} YOLO Detections & Tracker State ---".format(frame_count))
+            print("  Raw detections before NMS:")
+            for idx, (box, conf) in enumerate(zip(yolo_boxes, yolo_confidences)):
+                print("    - Raw index {}: box={}, conf={:.4f}".format(idx, box, conf))
+            print("  Detections after NMS:")
+            for idx in drone_nms_indices:
+                if idx in drone_size_rejections:
+                    print("    - Box={}, conf={:.4f}, {}".format(yolo_boxes[idx], yolo_confidences[idx], drone_size_rejections[idx]))
+                else:
+                    print("    - Box={}, conf={:.4f}, passed_size_gate=True".format(yolo_boxes[idx], yolo_confidences[idx]))
+            print("  Tracker State:")
+            for tid, track in tracker.tracks.items():
+                print("    - Track ID {}: bbox={}, conf={:.4f}, hits={}, consecutive_hits={}, misses={}, confirmed={}".format(
+                    tid, track['bbox'], track['conf'], track['hits'], track.get('consecutive_hits', 0), track['misses'], track.get('confirmed', False)
+                ))
+
+        # Write candidates debug files if DEBUG_DRONE is enabled and conf > 0.10
+        if DEBUG_DRONE:
+            DEBUG_DIR = "/home/jiacdi/bordershield_ai/debug_drone_frames/"
+            os.makedirs(DEBUG_DIR, exist_ok=True)
+            for idx, (box, conf) in enumerate(zip(yolo_boxes, yolo_confidences)):
+                if conf > DRONE_CANDIDATE_CONF:
+                    survived_nms = (idx in drone_nms_indices)
+                    matched_tid = None
+                    is_confirmed = False
+                    rejection_reason = "None"
+                    
+                    if not survived_nms:
+                        rejection_reason = "Rejected by NMS"
+                    elif idx in drone_size_rejections:
+                        rejection_reason = drone_size_rejections[idx]
+                    else:
+                        found_track = None
+                        for tid, track in tracker.tracks.items():
+                            if track['misses'] == 0 and track['bbox'] == box:
+                                found_track = track
+                                break
+                        if found_track:
+                            matched_tid = found_track['id']
+                            is_confirmed = found_track.get('confirmed', False)
+                            if not is_confirmed:
+                                if found_track.get('consecutive_hits', 0) < DRONE_CONFIRM_FRAMES:
+                                    rejection_reason = "Insufficient consecutive hits ({} < {})".format(found_track.get('consecutive_hits', 0), DRONE_CONFIRM_FRAMES)
+                                elif conf < DRONE_CONFIRM_CONF:
+                                    rejection_reason = "Confidence below confirmation threshold ({:.2f} < {:.2f})".format(conf, DRONE_CONFIRM_CONF)
+                        else:
+                            rejection_reason = "Failed to match to any active track"
+                            
+                    debug_frame = frame.copy()
+                    cv2.rectangle(debug_frame, (box[0], box[1]), (box[0]+box[2], box[1]+box[3]), (0, 255, 255), 2)
+                    lbl = "CANDIDATE Conf:{:.2f} NMS:{} ID:{}".format(conf, survived_nms, matched_tid)
+                    cv2.putText(debug_frame, lbl, (box[0], max(15, box[1] - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+                    
+                    img_name = "frame_{:06d}_cand_{}.jpg".format(frame_count, idx)
+                    json_name = "frame_{:06d}_cand_{}.json".format(frame_count, idx)
+                    
+                    cv2.imwrite(os.path.join(DEBUG_DIR, img_name), debug_frame)
+                    
+                    candidate_log = {
+                        "frame_id": frame_count,
+                        "confidence": round(conf, 4),
+                        "bbox": box,
+                        "nms_result": survived_nms,
+                        "tracker_id": matched_tid,
+                        "confirmed": is_confirmed,
+                        "rejection_reason": rejection_reason
+                    }
+                    with open(os.path.join(DEBUG_DIR, json_name), "w") as jf:
+                        json.dump(candidate_log, jf, indent=2)
+
+                    print("[DEBUG DRONE] Candidate frame={} index={} conf={:.2f}% nms={} track_id={} confirmed={} reason={}".format(
+                        frame_count, idx, conf * 100, survived_nms, matched_tid, is_confirmed, rejection_reason
+                    ))
+
+        # ----------------------------------------------------
+        # 4. DRAW FUTURISTIC HUD VISUALIZATIONS & COMPUTE GPS
+        # ----------------------------------------------------
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (330, 200), (30, 20, 10), -1)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+        # 1. Title
+        cv2.putText(frame, "BORDERSHIELD HUD | LEADER RECON", (20, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 2)
+        
+        # 2. Connection Status
+        conn_str = "CONNECTED" if telemetry["connected"] else "DISCONNECTED"
+        conn_color = (0, 255, 0) if telemetry["connected"] else (0, 0, 255)
+        cv2.putText(frame, "REAL MAVLINK: " + conn_str, (20, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.4, conn_color, 1)
+
+        # 3. Position and telemetry values (display actual telemetry values if connected, else "N/A")
+        if telemetry["connected"]:
+            cv2.putText(frame, "UAV POS: {:.6f}, {:.6f}".format(telemetry["latitude"], telemetry["longitude"]), (20, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (240, 240, 240), 1)
+            cv2.putText(frame, "UAV ALT: {:.1f}m AGL".format(telemetry["altitude"]), (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (240, 240, 240), 1)
+            cv2.putText(frame, "UAV ATT: Y={:.1f} P={:.1f} R={:.1f}".format(telemetry["heading"], telemetry["pitch"], telemetry["roll"]), (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (240, 240, 240), 1)
+            
+            # Map GPS Fix to text
+            fix_map = {0: "No Fix", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
+            fix_str = fix_map.get(telemetry["gps_fix"], "Unknown")
+            if not is_gps_valid:
+                cv2.putText(frame, "GPS INVALID / WAITING FOR GPS FIX", (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            else:
+                cv2.putText(frame, "GPS FIX: {} ({} Sats)".format(fix_str, telemetry["satellites"]), (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (240, 240, 240), 1)
+            
+            # Flight Mode & Armed Status
+            armed_str = "ARMED" if telemetry["armed"] else "DISARMED"
+            armed_color = (0, 0, 255) if telemetry["armed"] else (0, 255, 0)
+            cv2.putText(frame, "MODE: {} | ".format(telemetry["flight_mode"]), (20, 148), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (240, 240, 240), 1)
+            mode_size = cv2.getTextSize("MODE: {} | ".format(telemetry["flight_mode"]), cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+            cv2.putText(frame, armed_str, (20 + mode_size[0], 148), cv2.FONT_HERSHEY_SIMPLEX, 0.4, armed_color, 1)
+            
+            # Speed
+            cv2.putText(frame, "SPEED: {:.1f} m/s".format(telemetry["ground_speed"]), (20, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (240, 240, 240), 1)
+        else:
+            cv2.putText(frame, "UAV POS: N/A", (20, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+            cv2.putText(frame, "UAV ALT: N/A", (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+            cv2.putText(frame, "UAV ATT: N/A", (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+            cv2.putText(frame, "GPS FIX: N/A", (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+            cv2.putText(frame, "MODE: N/A", (20, 148), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+            cv2.putText(frame, "SPEED: N/A", (20, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+        
+        # We only determine status based on CONFIRMED tracks (hits >= 3 and conf >= 0.25)
+        confirmed_drone_found = False
+        best_confirmed_drone = None
+        best_drone_conf = 0.0
+        drone_details = []
+
+        # Iterate active tracks, checking confirmation threshold
+        for track in active_tracks:
+            loc = None  # Prevent scope crash - initialize loc inside the loop
+            tid = track['id']
+            conf = track['conf']
+            bx, by, bw, bh = track['smooth_bbox']
+
+            if conf > best_drone_conf:
+                best_drone_conf = conf
+
+            # Confirm criteria: track['confirmed'] is True AND conf >= DRONE_CONFIRM_CONF
+            is_confirmed = track.get('confirmed', False) and (conf >= DRONE_CONFIRM_CONF)
+            track['is_confirmed'] = is_confirmed
+
+            # Perform 3D FoV target localization only if telemetry and GPS are valid
+            if is_telemetry_valid and is_gps_valid:
+                loc = estimate_target_gps(track['smooth_bbox'], uav_state, frame.shape[:2], camera_params)
+                track['localization'] = loc
+            else:
+                track['localization'] = None
+
+            if is_confirmed:
+                confirmed_drone_found = True
+                alerts.append("DRONE {:.1f}%".format(conf * 100))
+                if best_confirmed_drone is None or conf > best_confirmed_drone['conf']:
+                    best_confirmed_drone = track
+
+            # Save track details including confirmation state
+            track_loc_details = None
+            if is_telemetry_valid and loc is not None:
+                track_loc_details = {
+                    "distance": round(loc["distance"], 2),
+                    "relative_x_body": round(loc["relative_x_body"], 2),
+                    "relative_y_body": round(loc["relative_y_body"], 2),
+                    "relative_z_body": round(loc["relative_z_body"], 2),
+                    "relative_x_ned": round(loc["relative_x_ned"], 2),
+                    "relative_y_ned": round(loc["relative_y_ned"], 2),
+                    "relative_z_ned": round(loc["relative_z_ned"], 2),
+                    "bearing_body_deg": round(loc["bearing_body_deg"], 2),
+                    "bearing_absolute_deg": round(loc["bearing_absolute_deg"], 2),
+                    "elevation_body_deg": round(loc["elevation_body_deg"], 2),
+                    "elevation_absolute_deg": round(loc["elevation_absolute_deg"], 2),
+                    "gps": {
+                        "latitude": round(loc["gps"]["latitude"], 6),
+                        "longitude": round(loc["gps"]["longitude"], 6),
+                        "altitude": round(loc["gps"]["altitude"], 1)
+                    }
+                }
+                auto_pause_latest_samples[tid] = {
+                    "estimated_lat": float(loc["gps"]["latitude"]),
+                    "estimated_lon": float(loc["gps"]["longitude"]),
+                    "estimated_alt": float(loc["gps"]["altitude"]),
+                    "confidence": float(conf),
+                    "range": float(loc["distance"]),
+                    "bearing": float(loc["bearing_body_deg"])
+                }
+            else:
+                auto_pause_latest_samples.pop(tid, None)
+
+            drone_details.append({
+                "track_id": tid,
+                "confidence": round(conf * 100, 2),
+                "bbox": [bx, by, bw, bh],
+                "is_confirmed": is_confirmed,
+                "localization": track_loc_details
+            })
+
+            # Draw drone visualization
+            if is_confirmed:
+                # Draw confirmed drone box in Red (Hostile Target)
+                cv2.rectangle(frame, (bx, by), (bx+bw, by+bh), (0, 0, 255), 2)
+                
+                # Corner HUD highlights
+                cv2.line(frame, (bx, by), (bx + int(bw*0.2), by), (0, 0, 255), 3)
+                cv2.line(frame, (bx, by), (bx, by + int(bh*0.2)), (0, 0, 255), 3)
+                cv2.line(frame, (bx + bw, by), (bx + bw - int(bw*0.2), by), (0, 0, 255), 3)
+                cv2.line(frame, (bx + bw, by), (bx + bw, by + int(bh*0.2)), (0, 0, 255), 3)
+                cv2.line(frame, (bx, by + bh), (bx + int(bw*0.2), by + bh), (0, 0, 255), 3)
+                cv2.line(frame, (bx, by + bh), (bx, by + bh - int(bh*0.2)), (0, 0, 255), 3)
+                cv2.line(frame, (bx + bw, by + bh), (bx + bw - int(bw*0.2), by + bh), (0, 0, 255), 3)
+                cv2.line(frame, (bx + bw, by + bh), (bx + bw, by + bh - int(bh*0.2)), (0, 0, 255), 3)
+
+                # Center target crosshair
+                cx_p = int(bx + bw/2)
+                cy_p = int(by + bh/2)
+                cv2.drawMarker(frame, (cx_p, cy_p), (0, 0, 255), cv2.MARKER_CROSS, 14, 2)
+
+                # Bounding box text information HUD
+                if loc is not None:
+                    labels = [
+                        "TARGET: DRONE [ID:{}] | {:.1f}%".format(tid, conf * 100),
+                        "RANGE: {:.1f}m | BRG: {:.1f}deg".format(loc["distance"], loc["bearing_body_deg"]),
+                        "GPS: {:.6f}, {:.6f}".format(loc["gps"]["latitude"], loc["gps"]["longitude"]),
+                        "ALT: {:.1f}m AGL".format(loc["gps"]["altitude"])
+                    ]
+                else:
+                    msg_err = "LOCALIZATION UNAVAILABLE (WAITING FOR GPS)" if telemetry["connected"] else "LOCALIZATION UNAVAILABLE (NO MAVLINK)"
+                    labels = [
+                        "TARGET: DRONE [ID:{}] | {:.1f}%".format(tid, conf * 100),
+                        msg_err
+                    ]
+
+                y_offset = by + bh + 15
+                for line in labels:
+                    cv2.putText(frame, line, (bx + 1, y_offset + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
+                    cv2.putText(frame, line, (bx, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 255), 1)
+                    y_offset += 15
+            else:
+                # Draw unconfirmed candidate in Yellow (Low confidence or fewer than 3 hits)
+                cv2.rectangle(frame, (bx, by), (bx+bw, by+bh), (0, 255, 255), 1)
+                cv2.putText(frame, "CANDIDATE [ID:{}] {:.1f}% (consec:{})".format(tid, conf * 100, track.get('consecutive_hits', 0)), 
+                            (bx, max(15, by - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+        status_color = (0, 0, 255) if confirmed_drone_found else (0, 255, 0)
+        status_text = "HOSTILE DRONE CONFIRMED" if confirmed_drone_found else "PATROLLING BORDER..."
+        cv2.putText(frame, "SYS STAT: " + status_text, (20, 188), cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
+
+        # Draw persons and vehicles
+        for det in confirmed_ssd:
+            label = det['label']
+            conf = det['conf']
+            bx, by, bw, bh = det['box']
+            
+            cv2.rectangle(frame, (bx, by), (bx+bw, by+bh), (0, 255, 0), 2)
+            cv2.rectangle(frame, (bx, by - 18), (bx + 110, by), (0, 255, 0), -1)
+            cv2.putText(frame, "{} {:.1f}%".format(label.upper(), conf * 100), (bx + 2, by - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+        elapsed = time.time() - start_time
+
+        # ----------------------------------------------------
+        # 5. LOG TARGET EVENT & SAVE IMAGES
+        # ----------------------------------------------------
+        # ----------------------------------------------------
+        # 5. TRACK SSD TARGETS & RUN ALERTS
+        # ----------------------------------------------------
+        ssd_detections = []
+        for det in confirmed_ssd:
+            ssd_detections.append({
+                'class_name': det['label'].upper(),
+                'box': det['box'],
+                'conf': det['conf']
+            })
+        active_ssd_tracks = ssd_tracker.update(ssd_detections)
+
+        # Localize and send alerts for tracked SSD victims
+        for track in active_ssd_tracks:
+            tid = track['id']
+            conf = track['conf']
+            class_name = track['class_name']
+            is_confirmed = track.get('confirmed', False)
+            
+            # Localize target
+            if is_telemetry_valid and is_gps_valid:
+                loc = estimate_target_gps(track['bbox'], uav_state, frame.shape[:2], camera_params)
+                track['localization'] = loc
+            else:
+                loc = None
+                track['localization'] = None
+                
+            # Perform alert checking
+            maybe_send_victim_alert(
+                mavlink_alert_sender,
+                class_name,
+                conf,
+                tid,
+                loc,
+                is_telemetry_valid,
+                is_gps_valid,
+                is_confirmed
+            )
+
+        # Determine if we have any confirmed target (drone or SSD)
+        best_confirmed_target = None
+        best_target_class = None
+        best_target_conf = 0.0
+        best_target_loc = None
+        best_target_id = None
+
+        if confirmed_drone_found and best_confirmed_drone:
+            best_confirmed_target = best_confirmed_drone
+            best_target_class = "DRONE"
+            best_target_conf = best_confirmed_drone["conf"]
+            best_target_loc = best_confirmed_drone.get("localization")
+            best_target_id = best_confirmed_drone["id"]
+
+        # Check SSD confirmed tracks
+        for track in active_ssd_tracks:
+            if track.get('confirmed', False):
+                conf = track['conf']
+                if conf > best_target_conf:
+                    best_confirmed_target = track
+                    best_target_class = track['class_name']
+                    best_target_conf = conf
+                    best_target_loc = track.get('localization')
+                    best_target_id = track['id']
+
+        # ----------------------------------------------------
+        # 6. LOG TARGET EVENT & SAVE IMAGES
+        # ----------------------------------------------------
+        if best_confirmed_target:
+            event = {
+                "frame_id": frame_count,
+                "timestamp": datetime.now().isoformat(),
+                "targets": list(set(alerts)),
+                "drone_best_confidence": round(best_drone_conf * 100, 2),
+                "status": "pending_approval" if is_telemetry_valid else "no_target",
+                "is_confirmed": True,
+                "uav_telemetry": uav_state,
+                "detection_details": drone_details,
+                "event_created_at": datetime.now().isoformat(),
+                "event_age_sec": 0.0,
+                "track_status": "confirmed",
+                "source": "leader_recon_ai",
+                "event_type": "{}_DETECTED".format(best_target_class),
+                "target_type": best_target_class,
+                "target_class": best_target_class,
+                "confidence": round(best_target_conf * 100, 2),
+                "track_id": best_target_id
+            }
+            if best_target_loc is not None:
+                event.update({
+                    "range_m": round(best_target_loc["distance"], 2),
+                    "bearing_deg": round(best_target_loc["bearing_body_deg"], 2),
+                    "estimated_lat": round(best_target_loc["gps"]["latitude"], 6),
+                    "estimated_lon": round(best_target_loc["gps"]["longitude"], 6),
+                    "estimated_alt": round(best_target_loc["gps"]["altitude"], 1),
+                    "leader_telemetry_used": uav_state
+                })
+            else:
+                event.update({
+                    "range_m": 0.0,
+                    "bearing_deg": 0.0,
+                    "estimated_lat": None,
+                    "estimated_lon": None,
+                    "estimated_alt": None,
+                    "leader_telemetry_used": uav_state
+                })
+
+            try:
+                with open(EVENT_FILE, "w") as f:
+                    json.dump(event, f, indent=2)
+            except Exception as e:
+                print("Warning: Failed to save event JSON:", e)
+
+            # Drone specific alert trigger (preserves legacy paths)
+            if confirmed_drone_found and best_confirmed_drone:
+                drone_loc = best_confirmed_drone.get("localization")
+                if ENABLE_AUTO_MISSION_PAUSE_ON_DETECTION:
+                    maybe_start_auto_pause(
+                        auto_pause_controller,
+                        best_confirmed_drone,
+                        drone_loc,
+                        telemetry,
+                        is_telemetry_valid,
+                        is_gps_valid
+                    )
+                else:
+                    maybe_send_mavlink_alert(
+                        mavlink_alert_sender,
+                        mavlink_alert_last_sent_by_track,
+                        best_confirmed_drone,
+                        drone_loc,
+                        is_telemetry_valid,
+                        is_gps_valid
+                    )
+        else:
+            # If no confirmed target, remove EVENT_FILE to prevent stale operator alerts
+            if os.path.exists(EVENT_FILE):
+                try:
+                    os.remove(EVENT_FILE)
+                except Exception:
+                    pass
+
+        # Print simple CLI status log conforming to requirements 6 and 7
+        if confirmed_drone_found:
+            print("Frame {} | active_tracks: {} | STATUS: HOSTILE DRONE CONFIRMED | inference_time: {:.3f}s".format(frame_count, len(active_tracks), elapsed))
+            for d in drone_details:
+                loc_details = d["localization"]
+                conf_status = "CONFIRMED" if d["is_confirmed"] else "CANDIDATE"
+                if loc_details is not None:
+                    print("  -> [{}] DRONE ID {}: Conf={:.1f}%, Range={:.1f}m, Target GPS: {:.6f}, {:.6f}".format(
+                        conf_status, d["track_id"], d["confidence"], loc_details["distance"], 
+                        loc_details["gps"]["latitude"], loc_details["gps"]["longitude"]
+                    ))
+                else:
+                    print("  -> [{}] DRONE ID {}: Conf={:.1f}%, Range=N/A, GPS=N/A".format(
+                        conf_status, d["track_id"], d["confidence"]
+                    ))
+        elif active_tracks:
+            # We have active tracks, but NONE of them are confirmed.
+            print("Frame {} | DRONE CANDIDATE ONLY - not confirmed | inference_time: {:.3f}s".format(frame_count, elapsed))
+            for d in drone_details:
+                print("  -> [CANDIDATE] DRONE ID {}: Conf={:.1f}%, Range=N/A, GPS=N/A".format(
+                    d["track_id"], d["confidence"]
+                ))
+        else:
+            # No active tracks at all
+            print("Frame {} | No drone candidate | inference_time: {:.3f}s".format(frame_count, elapsed))
+
+        try:
+            cv2.imwrite(DETECTION_IMAGE, frame)
+        except Exception as e:
+            print("Warning: Failed to write image snapshot:", e)
+
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    print("\nRecognition process stopped by operator.")
+
+finally:
+    cap.release()
+    if 'auto_pause_controller' in locals() and auto_pause_controller is not None:
+        auto_pause_controller.close()
+    if 'mavlink_alert_sender' in locals() and mavlink_alert_sender is not None:
+        mavlink_alert_sender.close()
+    if 'telemetry_service' in locals():
+        telemetry_service.stop()
+    if DARKNET_GPU_AVAILABLE and darknet_image is not None:
+        try:
+            darknet.free_image(darknet_image)
+            print("Freed Darknet GPU image allocation.")
+        except Exception:
+            pass
+    print("BorderShield Leader Recon AI system stopped.")

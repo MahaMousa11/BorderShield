@@ -1,0 +1,145 @@
+#!/bin/bash
+set -u
+
+PROJECT_DIR="/home/jiacdi/bordershield_ai"
+LOG_DIR="${PROJECT_DIR}/logs"
+LOG_FILE="${LOG_DIR}/leader_ai.log"
+PYTHON_BIN="/usr/bin/python3"
+AI_SCRIPT="${PROJECT_DIR}/live_detect_border_complete.py"
+CAMERA_DEVICES="/dev/video0 /dev/video1 /dev/video2 /dev/video3"
+MAVLINK_PRIMARY_DEV="/dev/ttyACM0"
+
+timestamp() {
+    date +"%Y-%m-%dT%H:%M:%S%z"
+}
+
+wait_for_device() {
+    local device_path="$1"
+    local label="$2"
+    local timeout_sec="$3"
+    local waited=0
+
+    while [ ! -e "$device_path" ] && [ "$waited" -lt "$timeout_sec" ]; do
+        echo "$(timestamp) Waiting for ${label} at ${device_path} (${waited}/${timeout_sec}s)"
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [ ! -e "$device_path" ]; then
+        echo "$(timestamp) ERROR: ${label} not found at ${device_path}"
+        return 1
+    fi
+
+    echo "$(timestamp) OK: ${label} found at ${device_path}"
+    ls -l "$device_path"
+    return 0
+}
+
+log_video_devices() {
+    local found=0
+    echo "$(timestamp) Existing /dev/video* devices:"
+    for device_path in /dev/video*; do
+        if [ -e "$device_path" ]; then
+            ls -l "$device_path"
+            found=1
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "$(timestamp) No /dev/video* devices currently exist"
+    fi
+}
+
+log_mavlink_devices() {
+    local found=0
+    echo "$(timestamp) Existing MAVLink candidate devices:"
+    for device_path in /dev/ttyACM* /dev/ttyUSB*; do
+        if [ -e "$device_path" ]; then
+            ls -l "$device_path"
+            found=1
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "$(timestamp) No MAVLink candidate devices found under /dev/ttyACM* or /dev/ttyUSB*"
+    fi
+}
+
+check_primary_mavlink_device() {
+    log_mavlink_devices
+    if [ -e "$MAVLINK_PRIMARY_DEV" ]; then
+        echo "$(timestamp) OK: primary Scout Pixhawk MAVLink device found at ${MAVLINK_PRIMARY_DEV}"
+        ls -l "$MAVLINK_PRIMARY_DEV"
+        return 0
+    fi
+
+    echo "$(timestamp) WARNING: primary Scout Pixhawk MAVLink device ${MAVLINK_PRIMARY_DEV} not found"
+    echo "$(timestamp) WARNING: continuing startup; AI MAVLink modules will handle reconnect/timeout"
+    return 0
+}
+
+wait_for_any_camera() {
+    local timeout_sec="$1"
+    local waited=0
+    local device_path=""
+
+    while [ "$waited" -lt "$timeout_sec" ]; do
+        for device_path in $CAMERA_DEVICES; do
+            if [ -e "$device_path" ]; then
+                echo "$(timestamp) OK: camera candidate found at ${device_path}"
+                log_video_devices
+                return 0
+            fi
+        done
+
+        echo "$(timestamp) Waiting for any camera from /dev/video0 to /dev/video3 (${waited}/${timeout_sec}s)"
+        log_video_devices
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    echo "$(timestamp) ERROR: no camera found from /dev/video0 to /dev/video3"
+    log_video_devices
+    return 1
+}
+
+mkdir -p "$LOG_DIR"
+cd "$PROJECT_DIR" || exit 1
+
+exec >> "$LOG_FILE" 2>&1
+
+echo "============================================================"
+echo "$(timestamp) BorderShield Leader AI launcher starting"
+echo "$(timestamp) User: $(id)"
+echo "$(timestamp) Working directory: $(pwd)"
+echo "$(timestamp) Python: $($PYTHON_BIN --version 2>&1)"
+echo "$(timestamp) Script: ${AI_SCRIPT}"
+
+if grep -q '^ENABLE_AUTO_MISSION_PAUSE_ON_DETECTION = False' "$AI_SCRIPT"; then
+    echo "$(timestamp) Safety: AUTO mission pause is disabled by default"
+else
+    echo "$(timestamp) WARNING: AUTO mission pause default is not False"
+fi
+
+if grep -q '^AUTO_PAUSE_DRY_RUN = True' "$AI_SCRIPT"; then
+    echo "$(timestamp) Safety: AUTO pause dry-run is enabled"
+else
+    echo "$(timestamp) WARNING: AUTO pause dry-run is not True"
+fi
+
+if [ -e "${PROJECT_DIR}/latest_target_event.json" ]; then
+    echo "$(timestamp) Notice: stale latest_target_event.json exists; AI startup code should clear it"
+else
+    echo "$(timestamp) OK: no stale latest_target_event.json before AI start"
+fi
+
+echo "$(timestamp) Waiting 5 seconds for camera and UART devices to settle"
+sleep 5
+
+check_primary_mavlink_device
+log_video_devices
+wait_for_any_camera 30 || exit 1
+
+echo "$(timestamp) Launching BorderShield Leader AI"
+"$PYTHON_BIN" -u "$AI_SCRIPT" --debug-drone
+exit_code=$?
+echo "$(timestamp) BorderShield Leader AI exited with code ${exit_code}"
+exit "$exit_code"

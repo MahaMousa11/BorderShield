@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+import threading
+import time
+
+from pymavlink import mavutil
+
+from scout_mavlink_alert import ScoutMAVLinkAlertSender
+
+
+DEFAULT_DEVICE = "/dev/ttyACM0"
+DEFAULT_BAUD = 115200
+DEFAULT_SOURCE_SYSTEM = 1
+DEFAULT_SOURCE_COMPONENT = 192
+DEFAULT_DIALECT = "ardupilotmega"
+
+ALLOWED_MODE_NAMES = set(["AUTO", "LOITER"])
+
+
+class ScoutAutoPauseController:
+    """Pause an ArduPilot AUTO mission in LOITER for alert sampling only."""
+
+    def __init__(
+        self,
+        telemetry=None,
+        alert_sender=None,
+        device=DEFAULT_DEVICE,
+        baud=DEFAULT_BAUD,
+        source_system=DEFAULT_SOURCE_SYSTEM,
+        source_component=DEFAULT_SOURCE_COMPONENT,
+        dialect=DEFAULT_DIALECT,
+        hold_mode="LOITER",
+        return_mode="AUTO",
+        hold_seconds=10,
+        cooldown_sec=30,
+        dry_run=True,
+        current_mode_provider=None,
+        sample_interval_sec=0.5,
+    ):
+        self.telemetry = telemetry
+        self.alert_sender = alert_sender
+        self.device = device
+        self.baud = baud
+        self.source_system = source_system
+        self.source_component = source_component
+        self.dialect = dialect
+        self.hold_mode = hold_mode.upper()
+        self.return_mode = return_mode.upper()
+        self.hold_seconds = float(hold_seconds)
+        self.cooldown_sec = float(cooldown_sec)
+        self.dry_run = bool(dry_run)
+        self.current_mode_provider = current_mode_provider
+        self.sample_interval_sec = float(sample_interval_sec)
+
+        self.mav = None
+        self._owned_sender = None
+        self._connected = False
+        self._last_pause_by_track = {}
+        self._active_tracks = set()
+        self._lock = threading.Lock()
+
+        self._validate_modes()
+
+    def connect(self, heartbeat_timeout=5.0):
+        if self.dry_run:
+            self._connected = True
+            print("AUTO PAUSE READY: dry-run enabled; no SET_MODE commands will be sent")
+            return True
+
+        if self.telemetry is not None:
+            # Wait for connection to be active in telemetry
+            start_time = time.time()
+            while time.time() - start_time < heartbeat_timeout:
+                if getattr(self.telemetry, "mav", None) is not None:
+                    break
+                time.sleep(0.1)
+            self.mav = getattr(self.telemetry, "mav", None) or getattr(self.telemetry, "master", None)
+            if self.mav is None:
+                raise TimeoutError("Shared MAVLink connection was not established within timeout")
+            self._connected = True
+            print("AUTO PAUSE READY: using shared MAVLink connection from telemetry")
+            return True
+
+        if self.alert_sender is not None:
+            if getattr(self.alert_sender, "telemetry", None) is not None:
+                self.telemetry = self.alert_sender.telemetry
+                self.mav = getattr(self.telemetry, "mav", None) or getattr(self.telemetry, "master", None)
+                self._connected = True
+                print("AUTO PAUSE READY: using shared MAVLink connection from alert_sender's telemetry")
+                return True
+            elif getattr(self.alert_sender, "mav", None) is not None:
+                self.mav = self.alert_sender.mav
+                self._connected = True
+                print("AUTO PAUSE READY: using existing Scout MAVLink alert connection")
+                return True
+
+        self._owned_sender = ScoutMAVLinkAlertSender(
+            device=self.device,
+            baud=self.baud,
+            source_system=self.source_system,
+            source_component=self.source_component,
+            dialect=self.dialect,
+        )
+        self._owned_sender.connect(heartbeat_timeout=heartbeat_timeout, request_streams=False)
+        self._owned_sender.start_heartbeat()
+        self.mav = self._owned_sender.mav
+        self._connected = True
+        print("AUTO PAUSE READY: connected to Scout Pixhawk")
+        return True
+
+    def close(self):
+        if self._owned_sender is not None:
+            self._owned_sender.close()
+            self._owned_sender = None
+        self.mav = None
+        self._connected = False
+
+    def get_current_mode(self, timeout=1.0):
+        mode = self._mode_from_provider()
+        if mode:
+            return mode
+
+        if self.telemetry is not None:
+            tel = self.telemetry.get_telemetry()
+            if tel["connected"]:
+                return tel["flight_mode"]
+            return None
+
+        if self.dry_run:
+            return None
+
+        if self.mav is None:
+            return None
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.mav.recv_match(type="HEARTBEAT", blocking=True, timeout=0.25)
+            if msg is None:
+                continue
+            mode = self._mode_from_heartbeat(msg)
+            if mode:
+                return mode
+        return None
+
+    def set_mode(self, mode_name):
+        mode_name = str(mode_name).upper()
+        if mode_name not in ALLOWED_MODE_NAMES:
+            raise ValueError("Refusing unsafe mode change to " + mode_name)
+
+        if self.dry_run:
+            print("DRY RUN: would set mode " + mode_name)
+            return True
+
+        if self.telemetry is not None:
+            self.telemetry.set_mode(mode_name)
+            return True
+
+        if self.mav is None:
+            raise RuntimeError("MAVLink connection is not open")
+
+        mapping = self.mav.mode_mapping()
+        if mode_name not in mapping:
+            raise RuntimeError("Mode " + mode_name + " not available in ArduPilot mode mapping")
+
+        mode_id = mapping[mode_name]
+        target_system = getattr(self.mav, "target_system", 0)
+        if not target_system:
+            raise RuntimeError("MAVLink target_system is not initialized")
+
+        print("AUTO PAUSE: setting Scout mode to " + mode_name)
+        self.mav.mav.set_mode_send(
+            target_system,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            mode_id,
+        )
+        self._flush()
+        return True
+
+    def pause_auto_mission_for_detection(self, track_id, sample_callback):
+        now = time.time()
+        with self._lock:
+            if track_id in self._active_tracks:
+                print("AUTO PAUSE SKIPPED: track_id {} pause already active".format(track_id))
+                return False
+
+            last_pause = self._last_pause_by_track.get(track_id)
+            if last_pause is not None and (now - last_pause) < self.cooldown_sec:
+                remaining = self.cooldown_sec - (now - last_pause)
+                print("AUTO PAUSE SKIPPED: track_id {} cooldown {:.1f}s remaining".format(track_id, remaining))
+                return False
+
+            current_mode = self.get_current_mode()
+            if current_mode != "AUTO":
+                print("AUTO PAUSE SKIPPED: current mode is {}, not AUTO".format(current_mode or "UNKNOWN"))
+                return False
+
+            self._active_tracks.add(track_id)
+            self._last_pause_by_track[track_id] = now
+
+        worker = threading.Thread(
+            target=self._pause_worker,
+            args=(track_id, sample_callback, current_mode),
+        )
+        worker.daemon = True
+        worker.start()
+        print("AUTO PAUSE STARTED: track_id {} AUTO -> {}".format(track_id, self.hold_mode))
+        return True
+
+    def _pause_worker(self, track_id, sample_callback, previous_mode):
+        samples = []
+        try:
+            if self.dry_run:
+                print("DRY RUN: would switch AUTO -> " + self.hold_mode)
+                print("DRY RUN: would hold {} seconds".format(int(self.hold_seconds)))
+            else:
+                self.set_mode(self.hold_mode)
+
+            end_time = time.time() + self.hold_seconds
+            while time.time() < end_time:
+                sample = self._read_sample(track_id, sample_callback)
+                if sample is not None:
+                    samples.append(sample)
+                time.sleep(self.sample_interval_sec)
+
+            if self.dry_run:
+                print("DRY RUN: would average target samples")
+            averaged = self._average_samples(samples)
+
+            if averaged is None:
+                print("AUTO PAUSE WARNING: no valid target samples collected for track_id {}".format(track_id))
+            elif self.dry_run:
+                print("DRY RUN: would send BS alert")
+                print(
+                    "DRY RUN: averaged target lat={:.7f} lon={:.7f} alt={:.1f} conf={:.3f} samples={}".format(
+                        averaged["estimated_lat"],
+                        averaged["estimated_lon"],
+                        averaged["estimated_alt"],
+                        averaged["confidence"],
+                        averaged["sample_count"],
+                    )
+                )
+            else:
+                self._send_alert(averaged)
+
+        except Exception as exc:
+            print("AUTO PAUSE WARNING: " + str(exc))
+        finally:
+            try:
+                if self.dry_run:
+                    print("DRY RUN: would switch {} -> {}".format(self.hold_mode, self.return_mode))
+                else:
+                    self.set_mode(self.return_mode if previous_mode == "AUTO" else previous_mode)
+            except Exception as exc:
+                print("AUTO PAUSE WARNING: return to AUTO failed: " + str(exc))
+
+            with self._lock:
+                self._active_tracks.discard(track_id)
+
+    def _send_alert(self, averaged):
+        sender = self.alert_sender or self._owned_sender
+        if sender is None:
+            raise RuntimeError("No Scout MAVLink alert sender is available")
+
+        result = sender.send_detection_alert(
+            averaged["estimated_lat"],
+            averaged["estimated_lon"],
+            averaged["estimated_alt"],
+            averaged["confidence"],
+            "DRONE",
+        )
+        print("AUTO PAUSE ALERT SENT: " + result.get("statustext", "BS,..."))
+
+    def _read_sample(self, track_id, sample_callback):
+        try:
+            sample = sample_callback(track_id)
+        except TypeError:
+            sample = sample_callback()
+        except Exception as exc:
+            print("AUTO PAUSE WARNING: sample callback failed: " + str(exc))
+            return None
+
+        if not sample:
+            return None
+
+        try:
+            parsed = {
+                "estimated_lat": float(sample["estimated_lat"]),
+                "estimated_lon": float(sample["estimated_lon"]),
+                "estimated_alt": float(sample["estimated_alt"]),
+                "confidence": float(sample["confidence"]),
+                "range": float(sample["range"]),
+                "bearing": float(sample["bearing"]),
+            }
+        except Exception:
+            return None
+
+        if abs(parsed["estimated_lat"]) < 1e-7 and abs(parsed["estimated_lon"]) < 1e-7:
+            return None
+        return parsed
+
+    def _average_samples(self, samples):
+        if not samples:
+            return None
+
+        keys = ["estimated_lat", "estimated_lon", "estimated_alt", "confidence", "range", "bearing"]
+        averaged = {}
+        for key in keys:
+            averaged[key] = sum(sample[key] for sample in samples) / float(len(samples))
+        averaged["sample_count"] = len(samples)
+        return averaged
+
+    def _mode_from_provider(self):
+        if self.current_mode_provider is None:
+            return None
+        try:
+            mode = self.current_mode_provider()
+        except Exception:
+            return None
+        if mode is None:
+            return None
+        return str(mode).upper()
+
+    def _mode_from_heartbeat(self, msg):
+        mapping = self.mav.mode_mapping() if self.mav is not None else {}
+        reverse = dict((v, k) for k, v in mapping.items())
+        custom_mode = getattr(msg, "custom_mode", None)
+        if custom_mode in reverse:
+            return reverse[custom_mode]
+
+        mode = getattr(self.mav, "flightmode", None)
+        if mode and not str(mode).startswith("Mode("):
+            return str(mode).upper()
+        return None
+
+    def _validate_modes(self):
+        if self.hold_mode != "LOITER":
+            raise ValueError("Only LOITER hold mode is allowed")
+        if self.return_mode != "AUTO":
+            raise ValueError("Only AUTO return mode is allowed")
+
+    def _flush(self):
+        try:
+            self.mav.port.flush()
+        except Exception:
+            pass
+
+
+def connect(**kwargs):
+    controller = ScoutAutoPauseController(**kwargs)
+    controller.connect()
+    return controller

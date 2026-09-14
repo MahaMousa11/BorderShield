@@ -1,0 +1,252 @@
+# BorderShield Scout MAVLink Alert Walkthrough
+
+## Current UART Setup
+
+- Scout Jetson to Scout Pixhawk UART: `/dev/ttyTHS2`
+- Baudrate: `115200`
+- MAVLink dialect: `ardupilotmega`
+- Scout Jetson sender identity: `source_system=1`, `source_component=191`
+- The Scout Jetson no longer directly commands the Response UAV in the new architecture.
+
+## Alert Routing
+
+1. Scout Jetson detects and confirms a target.
+2. Scout Jetson keeps writing the local JSON event for bench compatibility.
+3. Scout Jetson sends a MAVLink alert to the Scout Pixhawk when GPS/localization is valid.
+4. ArduPilot routes the alert to the GCS through CUAV P9.
+5. GCS/DIMP Threat Manager displays the alert to the operator.
+6. Operator approval is mandatory before any Response UAV dispatch.
+7. Response UAV should be dispatched only to a safe observation or standoff point.
+
+The Scout Jetson sends MAVLink alerts only for confirmed `DRONE` tracks. It does
+not send MAVLink alerts for `PERSON`, `CAR`, `BUS`, or `MOTORBIKE`.
+
+The Scout Jetson does not send a MAVLink alert when GPS/localization is invalid.
+When GPS is unavailable, the AI can still detect and track locally, and the
+local JSON/mission-manager bench flow remains available.
+
+The AI also applies a per-track cooldown so the same confirmed drone track does
+not send a MAVLink alert every frame.
+
+## Local JSON Flow
+
+`live_detect_border_complete.py` still writes:
+
+- `latest_target_event.json`
+- `latest_detection.jpg`
+
+The local Mission Manager and response-order files are kept for backward
+compatibility and bench testing:
+
+- `leader_recon_mission_v1.py`
+- `response_mission_order.json`
+
+## AI MAVLink Alert Flow
+
+Run the AI from the Scout Jetson:
+
+```bash
+cd /home/jiacdi/bordershield_ai
+python3 -u live_detect_border_complete.py --debug-drone
+```
+
+When a confirmed drone has valid target GPS/localization, the terminal should
+show:
+
+```text
+MAVLINK ALERT SENT: BS,<lat>,<lon>,<confidence_percent>,DRONE
+```
+
+If an alert is not sent, the AI prints a reason such as:
+
+```text
+MAVLINK ALERT SKIPPED: GPS/localization invalid
+MAVLINK ALERT SKIPPED: sender not connected
+MAVLINK ALERT SKIPPED: track_id 3 cooldown 7.5s remaining
+```
+
+The GCS/DIMP Threat Manager should receive a `STATUSTEXT` beginning with:
+
+```text
+BS,
+```
+
+The STATUSTEXT alert format is:
+
+```text
+BS,<lat>,<lon>,<confidence_percent>,<class>
+```
+
+The sender also transmits:
+
+- `NAMED_VALUE_INT` named `TGT_LAT` as `int(lat * 1e7)`
+- `NAMED_VALUE_INT` named `TGT_LON` as `int(lon * 1e7)`
+- `NAMED_VALUE_FLOAT` named `TGT_CONF` as confidence from `0.0` to `1.0`
+
+To disable MAVLink alerts for bench testing, edit the config near the top of
+`live_detect_border_complete.py`:
+
+```python
+ENABLE_MAVLINK_ALERTS = False
+```
+
+This disables only the MAVLink alert sender. It does not disable AI detection,
+tracking, GPS gating, local JSON events, Mission Manager, or debug tools.
+
+## UART Live Test
+
+With the Scout Pixhawk UART live, run:
+
+```bash
+cd /home/jiacdi/bordershield_ai
+python3 -u scout_mavlink_alert.py --test
+```
+
+The fake alert test waits for a Scout Pixhawk HEARTBEAT, reads current Scout GPS
+from `GLOBAL_POSITION_INT`, and sends one fake BorderShield alert using that
+location.
+
+Expected terminal signs:
+
+```text
+ScoutMAVLinkAlert: received HEARTBEAT from system/component ...
+ScoutMAVLinkAlert: GLOBAL_POSITION_INT lat=...
+ScoutMAVLinkAlert: sending STATUSTEXT BS,...
+ScoutMAVLinkAlert: test complete
+```
+
+Expected GCS STATUSTEXT begins with:
+
+```text
+BS,
+```
+
+## Legacy Fake Alert Test
+
+The standalone fake alert test remains useful before running the full AI:
+
+```bash
+cd /home/jiacdi/bordershield_ai
+python3 -u scout_mavlink_alert.py --test
+```
+
+It verifies the Scout Jetson can send MAVLink alerts through the Scout Pixhawk
+before real AI detections are connected to the GCS workflow.
+
+## AUTO Mission Pause Flow
+
+The Scout UAV normally flies its ArduPilot AUTO mission from Mission Planner.
+The AUTO pause feature is designed to temporarily hold the Scout only when all
+of these conditions are true:
+
+- target is a confirmed `DRONE`
+- GPS/localization is valid
+- target latitude/longitude/altitude are available
+- confidence is above the drone confirmation threshold
+- current Scout flight mode is `AUTO`
+
+When enabled, the flow is:
+
+1. Store the previous mode, expected to be `AUTO`.
+2. Switch Scout `AUTO -> LOITER`.
+3. Hold for `10` seconds.
+4. Keep collecting target samples:
+   - `estimated_lat`
+   - `estimated_lon`
+   - `estimated_alt`
+   - `confidence`
+   - `range`
+   - `bearing`
+5. Average the samples.
+6. Send one averaged `BS,` MAVLink alert to the GCS.
+7. Switch Scout `LOITER -> AUTO`.
+
+Returning to `AUTO` does not restart, clear, upload, or modify the mission. It
+allows ArduPilot to continue the existing AUTO mission from the current mission
+state.
+
+The feature has per-track cooldown so the same `track_id` does not repeatedly
+pause the mission.
+
+## AUTO Pause Dry-Run
+
+Dry-run is the default. Near the top of `live_detect_border_complete.py`:
+
+```python
+ENABLE_AUTO_MISSION_PAUSE_ON_DETECTION = False
+AUTO_PAUSE_DRY_RUN = True
+AUTO_PAUSE_HOLD_MODE = "LOITER"
+AUTO_PAUSE_RETURN_MODE = "AUTO"
+AUTO_PAUSE_SECONDS = 10
+AUTO_PAUSE_COOLDOWN_SEC = 30
+```
+
+To test the logic without sending `SET_MODE`, set:
+
+```python
+ENABLE_AUTO_MISSION_PAUSE_ON_DETECTION = True
+AUTO_PAUSE_DRY_RUN = True
+```
+
+Run:
+
+```bash
+cd /home/jiacdi/bordershield_ai
+python3 -u live_detect_border_complete.py --debug-drone
+```
+
+In dry-run, the AI must not send `SET_MODE`. Expected output:
+
+```text
+DRY RUN: would switch AUTO -> LOITER
+DRY RUN: would hold 10 seconds
+DRY RUN: would average target samples
+DRY RUN: would send BS alert
+DRY RUN: would switch LOITER -> AUTO
+```
+
+## Real Mode-Change Safety Checklist
+
+Real AUTO pause testing must be done only with props removed or in a controlled
+safe environment.
+
+Before setting `AUTO_PAUSE_DRY_RUN = False`, confirm:
+
+- props removed or aircraft otherwise made safe
+- pilot/operator is present and ready to take control
+- Mission Planner shows the aircraft in `AUTO`
+- UART `/dev/ttyTHS2` heartbeat is healthy
+- GPS fix and target localization are valid
+- GCS is receiving `BS,` alerts
+- no people are near moving parts
+- test area is controlled
+
+Allowed Scout mode changes from this software are only:
+
+- `AUTO -> LOITER`
+- `LOITER -> AUTO`
+
+This software must not arm, take off, land, send goto commands, modify missions,
+clear missions, upload missions, switch to RTL/LAND/BRAKE, command payloads, or
+command the Response UAV.
+
+## Disable Immediately
+
+To disable AUTO mission pause:
+
+```python
+ENABLE_AUTO_MISSION_PAUSE_ON_DETECTION = False
+```
+
+To disable all MAVLink BS alerts while keeping local JSON/debug behavior:
+
+```python
+ENABLE_MAVLINK_ALERTS = False
+```
+
+## Safety Reminder
+
+This module sends detection alerts only. It does not arm, guide, intercept,
+activate payloads, command weapons, or autonomously engage a target.
+
+GCS operator approval is mandatory before Response UAV dispatch.

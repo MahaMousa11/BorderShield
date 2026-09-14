@@ -1,0 +1,14 @@
+{
+  "frame_id": 1701,
+  "confidence": 0.1139,
+  "bbox": [
+    0,
+    305,
+    377,
+    175
+  ],
+  "nms_result": true,
+  "tracker_id": 32,
+  "confirmed": false,
+  "rejection_reason": "Confidence below confirmation threshold (0.11 < 0.25)"
+}

@@ -1,0 +1,14 @@
+{
+  "frame_id": 120,
+  "confidence": 0.1161,
+  "bbox": [
+    33,
+    0,
+    607,
+    447
+  ],
+  "nms_result": false,
+  "tracker_id": null,
+  "confirmed": false,
+  "rejection_reason": "Rejected by NMS"
+}

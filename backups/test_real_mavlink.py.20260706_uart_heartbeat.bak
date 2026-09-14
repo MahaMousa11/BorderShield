@@ -1,0 +1,88 @@
+import time
+import math
+from pymavlink import mavutil
+
+def main():
+    connection_string = '/dev/ttyTHS2'
+    print("Connecting directly to MAVLink telemetry on " + connection_string + " at 115200 baud...")
+    mav = mavutil.mavlink_connection(connection_string, baud=115200)
+    
+    # We will wait for a heartbeat to ensure the connection is active
+    print("Waiting for heartbeat...")
+    msg = mav.recv_match(type='HEARTBEAT', blocking=True, timeout=10.0)
+    if msg is None:
+        print("ERROR: Timeout waiting for heartbeat. Check Pixhawk connection.")
+        return
+        
+    print("\n--- MAVLink Connection Established ---")
+    
+    # Request data streams
+    mav.mav.request_data_stream_send(
+        mav.target_system,
+        mav.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_ALL,
+        4, # 4 Hz
+        1 # Start
+    )
+    
+    # Standard copter modes mapping
+    copter_modes = {
+        0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED",
+        5: "LOITER", 6: "RTL", 7: "CIRCLE", 9: "LAND", 11: "DRIFT",
+        13: "SPORT", 14: "FLIP", 15: "AUTOTUNE", 16: "POSHOLD",
+        17: "BRAKE", 18: "THROW", 19: "AVOID_ADSB", 20: "GUIDED_NOGPS",
+        21: "SMART_RTL", 22: "FLOWHOLD", 23: "FOLLOW", 24: "ZIGZAG"
+    }
+    
+    # Track metrics
+    lat, lon, alt = None, None, None
+    heading, pitch, roll = None, None, None
+    fix_type, satellites = None, None
+    
+    # Query for 5 seconds to gather latest parameters
+    start_time = time.time()
+    while time.time() - start_time < 5.0:
+        msg = mav.recv_match(blocking=True, timeout=0.5)
+        if msg is None:
+            continue
+            
+        msg_type = msg.get_type()
+        if msg_type == 'HEARTBEAT':
+            armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            flight_mode = copter_modes.get(msg.custom_mode, "UNKNOWN")
+            vehicle_type = msg.type
+            print("\nHeartbeat Received:")
+            print("  Vehicle Type:  " + str(vehicle_type))
+            print("  Flight Mode:   " + str(flight_mode))
+            print("  Armed State:   " + ("ARMED" if armed else "DISARMED"))
+            
+        elif msg_type == 'GLOBAL_POSITION_INT':
+            lat = msg.lat / 1e7
+            lon = msg.lon / 1e7
+            alt = msg.relative_alt / 1000.0
+            
+        elif msg_type == 'ATTITUDE':
+            roll = math.degrees(msg.roll)
+            pitch = math.degrees(msg.pitch)
+            heading = math.degrees(msg.yaw) % 360.0
+            
+        elif msg_type == 'GPS_RAW_INT':
+            fix_type = msg.fix_type
+            satellites = msg.satellites_visible
+
+    # Print final summary of telemetry values
+    print("\n--- Latest Telemetry Summary ---")
+    print("Latitude:    " + (f"{lat:.6f}" if lat is not None else "N/A"))
+    print("Longitude:   " + (f"{lon:.6f}" if lon is not None else "N/A"))
+    print("Altitude:    " + (f"{alt:.1f} m AGL" if alt is not None else "N/A"))
+    print("Heading:     " + (f"{heading:.1f} deg" if heading is not None else "N/A"))
+    print("Pitch:       " + (f"{pitch:.1f} deg" if pitch is not None else "N/A"))
+    print("Roll:        " + (f"{roll:.1f} deg" if roll is not None else "N/A"))
+    
+    fix_map = {0: "No Fix", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
+    fix_str = fix_map.get(fix_type, "Unknown")
+    print("GPS Fix:     " + (f"{fix_str} ({fix_type})" if fix_type is not None else "N/A"))
+    print("Satellites:  " + (str(satellites) if satellites is not None else "N/A"))
+
+if __name__ == '__main__':
+    main()

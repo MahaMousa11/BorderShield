@@ -1,0 +1,14 @@
+{
+  "frame_id": 359,
+  "confidence": 0.107,
+  "bbox": [
+    315,
+    419,
+    298,
+    47
+  ],
+  "nms_result": true,
+  "tracker_id": null,
+  "confirmed": false,
+  "rejection_reason": "Rejected by size gate: aspect ratio 6.34 outside 0.25-4.00"
+}

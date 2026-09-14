@@ -1,0 +1,14 @@
+{
+  "frame_id": 1697,
+  "confidence": 0.1565,
+  "bbox": [
+    0,
+    305,
+    393,
+    175
+  ],
+  "nms_result": true,
+  "tracker_id": 32,
+  "confirmed": false,
+  "rejection_reason": "Insufficient consecutive hits (2 < 3)"
+}

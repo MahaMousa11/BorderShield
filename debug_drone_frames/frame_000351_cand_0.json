@@ -1,0 +1,14 @@
+{
+  "frame_id": 351,
+  "confidence": 0.1432,
+  "bbox": [
+    255,
+    18,
+    319,
+    217
+  ],
+  "nms_result": true,
+  "tracker_id": null,
+  "confirmed": false,
+  "rejection_reason": "Rejected by SSD overlap: CAR target IoU 0.237"
+}

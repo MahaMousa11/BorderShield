@@ -1,0 +1,14 @@
+{
+  "frame_id": 869,
+  "confidence": 0.1111,
+  "bbox": [
+    0,
+    160,
+    402,
+    320
+  ],
+  "nms_result": true,
+  "tracker_id": null,
+  "confirmed": false,
+  "rejection_reason": "Rejected by size gate: area ratio 0.419 above 0.350"
+}

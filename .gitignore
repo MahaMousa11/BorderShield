@@ -1,0 +1,17 @@
+venv-ai/
+venv/
+__pycache__/
+*.pyc
+*.log
+*.bag
+*.bin
+*.tlog
+*.ulg
+*.mp4
+*.avi
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.weights
+*.onnx

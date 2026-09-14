@@ -1,0 +1,70 @@
+# BorderShield Scout MAVLink Alert Walkthrough
+
+## Current UART Setup
+
+- Scout Jetson to Scout Pixhawk UART: `/dev/ttyTHS2`
+- Baudrate: `115200`
+- MAVLink dialect: `ardupilotmega`
+- Scout Jetson sender identity: `source_system=1`, `source_component=191`
+- The Scout Jetson no longer directly commands the Response UAV in the new architecture.
+
+## Alert Routing
+
+1. Scout Jetson detects and confirms a target.
+2. Scout Jetson sends a MAVLink alert to the Scout Pixhawk.
+3. ArduPilot routes the alert to the GCS through CUAV P9.
+4. GCS/DIMP Threat Manager displays the alert to the operator.
+5. Operator approval is mandatory before any Response UAV dispatch.
+6. Response UAV should be dispatched only to a safe observation or standoff point.
+
+The local JSON flow remains available for backward compatibility and bench testing:
+
+- `latest_target_event.json`
+- `leader_recon_mission_v1.py`
+- `response_mission_order.json`
+
+## Fake Alert Test
+
+Run from the Scout Jetson:
+
+```bash
+cd /home/jiacdi/bordershield_ai
+python3 -u scout_mavlink_alert.py --test
+```
+
+The test waits for a Scout Pixhawk HEARTBEAT, reads current Scout GPS from
+`GLOBAL_POSITION_INT`, and sends one fake BorderShield alert using that location.
+
+Expected terminal signs:
+
+```text
+ScoutMAVLinkAlert: received HEARTBEAT from system/component ...
+ScoutMAVLinkAlert: GLOBAL_POSITION_INT lat=...
+ScoutMAVLinkAlert: sending STATUSTEXT BS,...
+ScoutMAVLinkAlert: test complete
+```
+
+Expected GCS STATUSTEXT begins with:
+
+```text
+BS,
+```
+
+The STATUSTEXT alert format is:
+
+```text
+BS,<lat>,<lon>,<confidence_percent>,<class>
+```
+
+The sender also transmits:
+
+- `NAMED_VALUE_INT` named `TGT_LAT` as `int(lat * 1e7)`
+- `NAMED_VALUE_INT` named `TGT_LON` as `int(lon * 1e7)`
+- `NAMED_VALUE_FLOAT` named `TGT_CONF` as confidence from `0.0` to `1.0`
+
+## Safety Reminder
+
+This module sends detection alerts only. It does not arm, guide, intercept,
+activate payloads, command weapons, or autonomously engage a target.
+
+GCS operator approval is mandatory before Response UAV dispatch.

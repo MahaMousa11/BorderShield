@@ -1,0 +1,14 @@
+{
+  "frame_id": 580,
+  "confidence": 0.1238,
+  "bbox": [
+    362,
+    139,
+    219,
+    318
+  ],
+  "nms_result": true,
+  "tracker_id": null,
+  "confirmed": false,
+  "rejection_reason": "Rejected by size gate: height ratio 0.662 above 0.650"
+}

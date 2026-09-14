@@ -1,0 +1,14 @@
+{
+  "frame_id": 96,
+  "confidence": 0.1106,
+  "bbox": [
+    508,
+    332,
+    132,
+    120
+  ],
+  "nms_result": true,
+  "tracker_id": null,
+  "confirmed": false,
+  "rejection_reason": "Failed to match to any active track"
+}

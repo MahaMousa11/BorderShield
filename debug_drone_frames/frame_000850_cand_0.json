@@ -1,0 +1,14 @@
+{
+  "frame_id": 850,
+  "confidence": 0.1644,
+  "bbox": [
+    0,
+    204,
+    349,
+    247
+  ],
+  "nms_result": true,
+  "tracker_id": null,
+  "confirmed": false,
+  "rejection_reason": "Rejected by SSD overlap: PERSON target IoU 0.221"
+}

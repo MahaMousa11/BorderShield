@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# Default values
+PORT="/dev/ttyTHS2"
+BAUD=57600
+
+# Allow command line overrides
+if [ ! -z "$1" ]; then
+    PORT="$1"
+fi
+if [ ! -z "$2" ]; then
+    BAUD="$2"
+fi
+
+LOG_DIR="/home/jiacdi/bordershield_ai/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/mavproxy_real.log"
+
+echo "Starting MAVProxy on port $PORT at $BAUD baud..."
+echo "Logging output to $LOG_FILE"
+
+# Start MAVProxy in background and redirect output
+nohup /home/jiacdi/.local/bin/mavproxy.py --master="$PORT" --baudrate "$BAUD" --out=udp:127.0.0.1:14550 --daemon > "$LOG_FILE" 2>&1 &
+
+# Print status check instruction
+sleep 1.5
+PID=$!
+if ps -p $PID > /dev/null; then
+    echo "MAVProxy successfully started in background with PID $PID"
+else
+    echo "ERROR: MAVProxy failed to start. Check logs at $LOG_FILE"
+fi

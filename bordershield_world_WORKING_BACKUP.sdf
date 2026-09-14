@@ -1,0 +1,494 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+
+  <world name="bordershield_world">
+
+    <!-- ================================================= -->
+    <!-- PHYSICS                                           -->
+    <!-- ================================================= -->
+
+    <physics name="1ms" type="ignore">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+
+    <plugin filename="gz-sim-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+
+    <plugin filename="gz-sim-imu-system"
+            name="gz::sim::systems::Imu"/>
+
+    <plugin filename="gz-sim-navsat-system"
+            name="gz::sim::systems::NavSat"/>
+
+
+    <!-- ================================================= -->
+    <!-- ENVIRONMENT                                       -->
+    <!-- ================================================= -->
+
+    <scene>
+      <ambient>1.0 1.0 1.0</ambient>
+      <background>0.72 0.78 0.85</background>
+      <sky/>
+    </scene>
+
+
+    <!-- Same GPS origin used by our working SITL setup -->
+
+    <spherical_coordinates>
+      <latitude_deg>-35.363262</latitude_deg>
+      <longitude_deg>149.165237</longitude_deg>
+      <elevation>584</elevation>
+      <heading_deg>0</heading_deg>
+      <surface_model>EARTH_WGS84</surface_model>
+    </spherical_coordinates>
+
+
+    <!-- ================================================= -->
+    <!-- SUN                                               -->
+    <!-- ================================================= -->
+
+    <light type="directional" name="sun">
+
+      <cast_shadows>true</cast_shadows>
+
+      <pose>
+        0 0 10 0 0 0
+      </pose>
+
+      <diffuse>
+        0.8 0.8 0.8 1
+      </diffuse>
+
+      <specular>
+        0.8 0.8 0.8 1
+      </specular>
+
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+
+      <direction>
+        -0.5 0.1 -0.9
+      </direction>
+
+    </light>
+
+
+    <!-- ================================================= -->
+    <!-- COORDINATE AXES                                   -->
+    <!-- ================================================= -->
+
+    <model name="axes">
+
+      <static>true</static>
+
+      <link name="link">
+
+        <sensor name="navsat_sensor"
+                type="navsat">
+
+          <always_on>true</always_on>
+
+          <update_rate>
+            1
+          </update_rate>
+
+        </sensor>
+
+      </link>
+
+    </model>
+
+
+    <!-- ================================================= -->
+    <!-- BASE / RUNWAY                                     -->
+    <!-- ================================================= -->
+
+    <include>
+
+      <uri>
+        model://runway
+      </uri>
+
+      <name>
+        bordershield_base
+      </name>
+
+      <pose degrees="true">
+        -29 545 0 0 0 363
+      </pose>
+
+    </include>
+
+
+    <!-- ================================================= -->
+    <!-- RECON DRONE                                       -->
+    <!-- Starts inside the base                            -->
+    <!-- ================================================= -->
+
+    <include>
+
+      <uri>
+        model://iris_with_gimbal
+      </uri>
+
+      <name>
+        recon_drone
+      </name>
+
+      <pose degrees="true">
+        -2 0 0.195 0 0 90
+      </pose>
+
+    </include>
+
+
+    <!-- ================================================= -->
+    <!-- RESPONSE DRONE                                    -->
+    <!-- Remains at base until operator approval           -->
+    <!-- ================================================= -->
+
+    <include>
+
+      <uri>
+        model://iris_with_gimbal
+      </uri>
+
+      <name>
+        response_drone
+      </name>
+
+      <pose degrees="true">
+        2 0 0.195 0 0 90
+      </pose>
+
+    </include>
+
+
+    <!-- ================================================= -->
+    <!-- PERSON TARGET                                     -->
+    <!-- Local primitive model - no Fuel download needed   -->
+    <!-- ================================================= -->
+
+    <model name="person_target">
+
+      <static>true</static>
+
+      <pose>
+        25 12 0 0 0 0
+      </pose>
+
+
+      <!-- body -->
+
+      <link name="body">
+
+        <visual name="torso">
+
+          <pose>
+            0 0 1.15 0 0 0
+          </pose>
+
+          <geometry>
+
+            <cylinder>
+              <radius>0.22</radius>
+              <length>0.9</length>
+            </cylinder>
+
+          </geometry>
+
+          <material>
+            <ambient>0.15 0.15 0.7 1</ambient>
+            <diffuse>0.15 0.15 0.7 1</diffuse>
+          </material>
+
+        </visual>
+
+
+        <!-- head -->
+
+        <visual name="head">
+
+          <pose>
+            0 0 1.8 0 0 0
+          </pose>
+
+          <geometry>
+
+            <sphere>
+              <radius>0.20</radius>
+            </sphere>
+
+          </geometry>
+
+          <material>
+            <ambient>0.8 0.6 0.45 1</ambient>
+            <diffuse>0.8 0.6 0.45 1</diffuse>
+          </material>
+
+        </visual>
+
+
+        <!-- left leg -->
+
+        <visual name="left_leg">
+
+          <pose>
+            -0.12 0 0.45 0 0 0
+          </pose>
+
+          <geometry>
+
+            <cylinder>
+              <radius>0.08</radius>
+              <length>0.8</length>
+            </cylinder>
+
+          </geometry>
+
+          <material>
+            <ambient>0.1 0.1 0.1 1</ambient>
+            <diffuse>0.1 0.1 0.1 1</diffuse>
+          </material>
+
+        </visual>
+
+
+        <!-- right leg -->
+
+        <visual name="right_leg">
+
+          <pose>
+            0.12 0 0.45 0 0 0
+          </pose>
+
+          <geometry>
+
+            <cylinder>
+              <radius>0.08</radius>
+              <length>0.8</length>
+            </cylinder>
+
+          </geometry>
+
+          <material>
+            <ambient>0.1 0.1 0.1 1</ambient>
+            <diffuse>0.1 0.1 0.1 1</diffuse>
+          </material>
+
+        </visual>
+
+      </link>
+
+    </model>
+
+
+    <!-- ================================================= -->
+    <!-- VEHICLE TARGET                                    -->
+    <!-- Local model, no external download                 -->
+    <!-- ================================================= -->
+
+    <model name="vehicle_target">
+
+      <static>true</static>
+
+      <pose>
+        35 -15 0.5 0 0 0.6
+      </pose>
+
+
+      <link name="vehicle_body">
+
+        <!-- main chassis -->
+
+        <visual name="chassis">
+
+          <pose>
+            0 0 0.45 0 0 0
+          </pose>
+
+          <geometry>
+
+            <box>
+              <size>3.8 1.8 0.7</size>
+            </box>
+
+          </geometry>
+
+          <material>
+            <ambient>0.55 0.08 0.08 1</ambient>
+            <diffuse>0.55 0.08 0.08 1</diffuse>
+          </material>
+
+        </visual>
+
+
+        <!-- cabin -->
+
+        <visual name="cabin">
+
+          <pose>
+            -0.25 0 1.05 0 0 0
+          </pose>
+
+          <geometry>
+
+            <box>
+              <size>1.9 1.55 0.65</size>
+            </box>
+
+          </geometry>
+
+          <material>
+            <ambient>0.25 0.25 0.28 1</ambient>
+            <diffuse>0.25 0.25 0.28 1</diffuse>
+          </material>
+
+        </visual>
+
+
+        <!-- wheels -->
+
+        <visual name="wheel_fl">
+
+          <pose>
+            1.15 0.95 0.25 1.5708 0 0
+          </pose>
+
+          <geometry>
+            <cylinder>
+              <radius>0.32</radius>
+              <length>0.22</length>
+            </cylinder>
+          </geometry>
+
+          <material>
+            <ambient>0.03 0.03 0.03 1</ambient>
+            <diffuse>0.03 0.03 0.03 1</diffuse>
+          </material>
+
+        </visual>
+
+
+        <visual name="wheel_fr">
+
+          <pose>
+            1.15 -0.95 0.25 1.5708 0 0
+          </pose>
+
+          <geometry>
+            <cylinder>
+              <radius>0.32</radius>
+              <length>0.22</length>
+            </cylinder>
+          </geometry>
+
+          <material>
+            <ambient>0.03 0.03 0.03 1</ambient>
+            <diffuse>0.03 0.03 0.03 1</diffuse>
+          </material>
+
+        </visual>
+
+
+        <visual name="wheel_rl">
+
+          <pose>
+            -1.15 0.95 0.25 1.5708 0 0
+          </pose>
+
+          <geometry>
+            <cylinder>
+              <radius>0.32</radius>
+              <length>0.22</length>
+            </cylinder>
+          </geometry>
+
+          <material>
+            <ambient>0.03 0.03 0.03 1</ambient>
+            <diffuse>0.03 0.03 0.03 1</diffuse>
+          </material>
+
+        </visual>
+
+
+        <visual name="wheel_rr">
+
+          <pose>
+            -1.15 -0.95 0.25 1.5708 0 0
+          </pose>
+
+          <geometry>
+            <cylinder>
+              <radius>0.32</radius>
+              <length>0.22</length>
+            </cylinder>
+          </geometry>
+
+          <material>
+            <ambient>0.03 0.03 0.03 1</ambient>
+            <diffuse>0.03 0.03 0.03 1</diffuse>
+          </material>
+
+        </visual>
+
+      </link>
+
+    </model>
+
+
+    <!-- ================================================= -->
+    <!-- BORDER MARKERS                                    -->
+    <!-- ================================================= -->
+
+    <model name="border_marker">
+
+      <static>true</static>
+
+      <pose>
+        20 0 0.05 0 0 0
+      </pose>
+
+      <link name="link">
+
+        <visual name="line">
+
+          <geometry>
+
+            <box>
+              <size>0.20 70 0.10</size>
+            </box>
+
+          </geometry>
+
+          <material>
+            <ambient>0.9 0.75 0.05 1</ambient>
+            <diffuse>0.9 0.75 0.05 1</diffuse>
+          </material>
+
+        </visual>
+
+      </link>
+
+    </model>
+
+
+  </world>
+
+</sdf>

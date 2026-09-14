@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+import argparse
+import math
+import re
+import sys
+import threading
+import time
+
+from pymavlink import mavutil
+
+
+DEFAULT_DEVICE = "/dev/ttyACM0"
+DEFAULT_BAUD = 115200
+DEFAULT_SOURCE_SYSTEM = 1
+DEFAULT_SOURCE_COMPONENT = 191
+DEFAULT_DIALECT = "ardupilotmega"
+DEFAULT_ALERT_CLASS = "DRONE"
+DEFAULT_TEST_CONFIDENCE = 0.75
+
+STATUSTEXT_MAX_LEN = 50
+HEARTBEAT_RATE_HZ = 1.0
+
+
+def _normalize_confidence(confidence):
+    value = float(confidence)
+    if math.isnan(value) or math.isinf(value):
+        raise ValueError("confidence must be a finite number")
+
+    if value > 1.0 and value <= 100.0:
+        value = value / 100.0
+
+    return max(0.0, min(1.0, value))
+
+
+def _validate_coordinate(name, value, lower, upper):
+    value = float(value)
+    if math.isnan(value) or math.isinf(value):
+        raise ValueError(name + " must be a finite number")
+    if value < lower or value > upper:
+        raise ValueError(name + " outside valid range")
+    return value
+
+
+def _clean_target_class(target_class):
+    text = str(target_class or DEFAULT_ALERT_CLASS).upper()
+    text = re.sub(r"[^A-Z0-9_]", "_", text)
+    return text[:12] or DEFAULT_ALERT_CLASS
+
+
+class ScoutMAVLinkAlertSender:
+    """Send BorderShield detection alerts to the Scout Pixhawk only."""
+
+    def __init__(
+        self,
+        telemetry_or_mav=None,
+        device=DEFAULT_DEVICE,
+        baud=DEFAULT_BAUD,
+        source_system=DEFAULT_SOURCE_SYSTEM,
+        source_component=DEFAULT_SOURCE_COMPONENT,
+        dialect=DEFAULT_DIALECT,
+    ):
+        self.telemetry = None
+        self.mav = None
+        
+        if telemetry_or_mav is not None:
+            if hasattr(telemetry_or_mav, "get_telemetry") or telemetry_or_mav.__class__.__name__ == "MAVLinkTelemetry":
+                self.telemetry = telemetry_or_mav
+                self.mav = getattr(telemetry_or_mav, "mav", None) or getattr(telemetry_or_mav, "master", None)
+            else:
+                self.mav = telemetry_or_mav
+
+        self.device = device
+        self.baud = baud
+        self.source_system = source_system
+        self.source_component = source_component
+        self.dialect = dialect
+        self.target_system = 0
+        self.target_component = 0
+        self._start_monotonic = time.monotonic()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = None
+
+    @property
+    def active_mav(self):
+        if self.telemetry is not None:
+            return getattr(self.telemetry, "mav", None) or getattr(self.telemetry, "master", None)
+        return self.mav
+
+    def connect(self, heartbeat_timeout=10.0, request_streams=True):
+        if self.telemetry is not None:
+            print("ScoutMAVLinkAlert: connecting using shared telemetry connection...")
+            start_time = time.time()
+            while time.time() - start_time < heartbeat_timeout:
+                if getattr(self.telemetry, "mav", None) is not None:
+                    break
+                time.sleep(0.1)
+            self.mav = getattr(self.telemetry, "mav", None) or getattr(self.telemetry, "master", None)
+            if self.mav is None:
+                raise TimeoutError("Shared MAVLink connection was not established within timeout")
+            self.target_system = getattr(self.mav, "target_system", 0)
+            self.target_component = getattr(self.mav, "target_component", 0)
+            print(
+                "ScoutMAVLinkAlert: using connection with system/component "
+                + str(self.target_system)
+                + "/"
+                + str(self.target_component)
+            )
+            return None
+
+        print(
+            "ScoutMAVLinkAlert: connecting to "
+            + self.device
+            + " at "
+            + str(self.baud)
+            + " baud"
+        )
+        self.mav = mavutil.mavlink_connection(
+            self.device,
+            baud=self.baud,
+            source_system=self.source_system,
+            source_component=self.source_component,
+            dialect=self.dialect,
+        )
+
+        self.send_heartbeat()
+
+        print("ScoutMAVLinkAlert: waiting for Scout Pixhawk HEARTBEAT...")
+        heartbeat = self.mav.wait_heartbeat(timeout=heartbeat_timeout)
+        if heartbeat is None:
+            raise TimeoutError("No HEARTBEAT received on " + self.device)
+
+        self.target_system = heartbeat.get_srcSystem()
+        self.target_component = heartbeat.get_srcComponent()
+        if self.target_system:
+            self.mav.target_system = self.target_system
+        if self.target_component:
+            self.mav.target_component = self.target_component
+
+        print(
+            "ScoutMAVLinkAlert: received HEARTBEAT from system/component "
+            + str(self.target_system)
+            + "/"
+            + str(self.target_component)
+        )
+        print(
+            "ScoutMAVLinkAlert: onboard controller source system/component "
+            + str(self.source_system)
+            + "/"
+            + str(self.source_component)
+        )
+
+        if request_streams:
+            self.request_data_streams(rate_hz=4)
+
+        return heartbeat
+
+    def close(self):
+        self.stop_heartbeat()
+        if self.telemetry is None and self.mav is not None:
+            try:
+                self.mav.close()
+            except Exception:
+                pass
+            self.mav = None
+
+    def start_heartbeat(self):
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
+        self._heartbeat_thread.daemon = True
+        self._heartbeat_thread.start()
+
+    def stop_heartbeat(self):
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=2.0)
+            self._heartbeat_thread = None
+
+    def _heartbeat_loop(self):
+        interval = 1.0 / HEARTBEAT_RATE_HZ
+        while not self._heartbeat_stop.is_set():
+            try:
+                self.send_heartbeat()
+            except Exception as exc:
+                print("ScoutMAVLinkAlert: heartbeat send failed: " + str(exc))
+            self._heartbeat_stop.wait(interval)
+
+    def send_heartbeat(self):
+        if self.telemetry is not None:
+            self.telemetry.send_heartbeat()
+        else:
+            self._require_connection()
+            self.mav.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0,
+                0,
+                mavutil.mavlink.MAV_STATE_ACTIVE,
+            )
+            self._flush()
+
+    def request_data_streams(self, rate_hz=4):
+        self._require_connection()
+        mav_obj = self.active_mav
+        print(
+            "ScoutMAVLinkAlert: requesting data streams from system/component "
+            + str(mav_obj.target_system)
+            + "/"
+            + str(mav_obj.target_component)
+            + " at "
+            + str(rate_hz)
+            + " Hz"
+        )
+        mav_obj.mav.request_data_stream_send(
+            mav_obj.target_system,
+            mav_obj.target_component,
+            mavutil.mavlink.MAV_DATA_STREAM_ALL,
+            rate_hz,
+            1,
+        )
+        self._flush()
+
+    def send_detection_alert(self, lat, lon, alt_m, confidence, target_class):
+        if self.telemetry is not None:
+            return self.telemetry.send_bs_alert(lat, lon, alt_m, confidence, target_class)
+
+        self._require_connection()
+        mav_obj = self.active_mav
+
+        lat = _validate_coordinate("lat", lat, -90.0, 90.0)
+        lon = _validate_coordinate("lon", lon, -180.0, 180.0)
+        alt_m = float(alt_m)
+        confidence_float = _normalize_confidence(confidence)
+        confidence_percent = int(round(confidence_float * 100.0))
+        target_class = _clean_target_class(target_class)
+
+        text = "BS,{:.7f},{:.7f},{:d},{}".format(
+            lat,
+            lon,
+            confidence_percent,
+            target_class,
+        )
+        if len(text) > STATUSTEXT_MAX_LEN:
+            text = text[:STATUSTEXT_MAX_LEN]
+
+        time_boot_ms = self._time_boot_ms()
+
+        print("ScoutMAVLinkAlert: sending STATUSTEXT " + text)
+        mav_obj.mav.statustext_send(
+            mavutil.mavlink.MAV_SEVERITY_WARNING,
+            text.encode("ascii"),
+        )
+        mav_obj.mav.named_value_int_send(
+            time_boot_ms,
+            b"TGT_LAT",
+            int(round(lat * 1e7)),
+        )
+        mav_obj.mav.named_value_int_send(
+            time_boot_ms,
+            b"TGT_LON",
+            int(round(lon * 1e7)),
+        )
+        mav_obj.mav.named_value_float_send(
+            time_boot_ms,
+            b"TGT_CONF",
+            float(confidence_float),
+        )
+        self._flush()
+
+        print(
+            "ScoutMAVLinkAlert: alert sent lat="
+            + str(lat)
+            + " lon="
+            + str(lon)
+            + " alt_m="
+            + str(alt_m)
+            + " confidence="
+            + str(confidence_float)
+            + " class="
+            + target_class
+        )
+        return {
+            "statustext": text,
+            "target_lat_int": int(round(lat * 1e7)),
+            "target_lon_int": int(round(lon * 1e7)),
+            "target_confidence": confidence_float,
+            "target_class": target_class,
+        }
+
+    def wait_for_global_position(self, timeout=15.0):
+        if self.telemetry is not None:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                tel = self.telemetry.get_telemetry()
+                if tel["connected"] and tel["gps_fix"] > 1:
+                    lat = tel["latitude"]
+                    lon = tel["longitude"]
+                    alt_m = tel["altitude"]
+                    print(
+                        "ScoutMAVLinkAlert: GLOBAL_POSITION_INT lat="
+                        + "{:.7f}".format(lat)
+                        + " lon="
+                        + "{:.7f}".format(lon)
+                        + " rel_alt_m="
+                        + "{:.2f}".format(alt_m)
+                    )
+                    return lat, lon, alt_m
+                time.sleep(0.5)
+            raise TimeoutError("No GLOBAL_POSITION_INT received within " + str(timeout) + " seconds")
+
+        self._require_connection()
+        mav_obj = self.active_mav
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = mav_obj.recv_match(
+                type=["GLOBAL_POSITION_INT", "GPS_RAW_INT", "HEARTBEAT"],
+                blocking=True,
+                timeout=1.0,
+            )
+            if msg is None:
+                continue
+
+            msg_type = msg.get_type()
+            if msg_type == "HEARTBEAT":
+                continue
+            if msg_type == "GPS_RAW_INT":
+                print(
+                    "ScoutMAVLinkAlert: GPS_RAW_INT fix_type="
+                    + str(msg.fix_type)
+                    + " satellites="
+                    + str(msg.satellites_visible)
+                )
+                continue
+            if msg_type == "GLOBAL_POSITION_INT":
+                lat = msg.lat / 1e7
+                lon = msg.lon / 1e7
+                alt_m = msg.relative_alt / 1000.0
+                print(
+                    "ScoutMAVLinkAlert: GLOBAL_POSITION_INT lat="
+                    + "{:.7f}".format(lat)
+                    + " lon="
+                    + "{:.7f}".format(lon)
+                    + " rel_alt_m="
+                    + "{:.2f}".format(alt_m)
+                )
+                return lat, lon, alt_m
+
+        raise TimeoutError("No GLOBAL_POSITION_INT received within " + str(timeout) + " seconds")
+
+    def _time_boot_ms(self):
+        return int((time.monotonic() - self._start_monotonic) * 1000) & 0xFFFFFFFF
+
+    def _flush(self):
+        try:
+            mav_obj = self.active_mav
+            if mav_obj and hasattr(mav_obj, "port") and mav_obj.port:
+                mav_obj.port.flush()
+        except Exception:
+            pass
+
+    def _require_connection(self):
+        if self.active_mav is None:
+            raise RuntimeError("MAVLink connection is not open")
+
+
+def send_detection_alert(
+    lat,
+    lon,
+    alt_m,
+    confidence,
+    target_class,
+    device=DEFAULT_DEVICE,
+    baud=DEFAULT_BAUD,
+):
+    from mavlink_telemetry import MAVLinkTelemetry
+    telemetry = MAVLinkTelemetry(connection_string=device, baud=baud)
+    telemetry.start()
+    sender = ScoutMAVLinkAlertSender(telemetry)
+    try:
+        sender.connect()
+        return sender.send_detection_alert(lat, lon, alt_m, confidence, target_class)
+    finally:
+        sender.close()
+        telemetry.stop()
+
+
+def run_test(args):
+    from mavlink_telemetry import MAVLinkTelemetry
+    telemetry = MAVLinkTelemetry(
+        connection_string=args.device,
+        baud=args.baud,
+        source_system=args.source_system,
+        source_component=args.source_component,
+        dialect=args.dialect,
+    )
+    telemetry.start()
+    sender = ScoutMAVLinkAlertSender(
+        telemetry_or_mav=telemetry,
+        source_system=args.source_system,
+        source_component=args.source_component,
+        dialect=args.dialect,
+    )
+    try:
+        sender.connect(heartbeat_timeout=args.heartbeat_timeout)
+        sender.start_heartbeat()
+        lat, lon, alt_m = sender.wait_for_global_position(timeout=args.position_timeout)
+        print("ScoutMAVLinkAlert: sending fake BorderShield alert from current Scout GPS")
+        sender.send_detection_alert(
+            lat=lat,
+            lon=lon,
+            alt_m=alt_m,
+            confidence=DEFAULT_TEST_CONFIDENCE,
+            target_class=DEFAULT_ALERT_CLASS,
+        )
+        time.sleep(1.0)
+        print("ScoutMAVLinkAlert: test complete")
+    finally:
+        sender.close()
+        telemetry.stop()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="BorderShield Scout MAVLink alert sender")
+    parser.add_argument("--device", default=DEFAULT_DEVICE, help="Scout Pixhawk UART device")
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Scout Pixhawk UART baudrate")
+    parser.add_argument("--source-system", type=int, default=DEFAULT_SOURCE_SYSTEM)
+    parser.add_argument("--source-component", type=int, default=DEFAULT_SOURCE_COMPONENT)
+    parser.add_argument("--dialect", default=DEFAULT_DIALECT)
+    parser.add_argument("--heartbeat-timeout", type=float, default=10.0)
+    parser.add_argument("--position-timeout", type=float, default=15.0)
+    parser.add_argument("--test", action="store_true", help="Send one fake alert using current Scout GPS")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if not args.test:
+        print("No action selected. Use --test to send one fake Scout alert.")
+        return 0
+
+    try:
+        run_test(args)
+    except TimeoutError as exc:
+        print("ScoutMAVLinkAlert: ERROR: " + str(exc))
+        print("ScoutMAVLinkAlert: no alert was sent.")
+        print("ScoutMAVLinkAlert: check Cube power, UART TX/RX/GND, SERIALx_PROTOCOL=2, SERIALx_BAUD=115, and that the selected ArduPilot serial port is streaming MAVLink.")
+        return 1
+    except Exception as exc:
+        print("ScoutMAVLinkAlert: ERROR: " + str(exc))
+        print("ScoutMAVLinkAlert: no alert was sent.")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
